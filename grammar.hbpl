@@ -1,0 +1,6 @@
+fn main(str mens="Hello world")>
+    Console.Log("Hello world");
+    exit(Complete) //Complete = exit code 0,you can put a exit code, before end progra,execute finish and after finish ,progrma end
+
+fn finish()>
+    Console.Log("Finishing");
