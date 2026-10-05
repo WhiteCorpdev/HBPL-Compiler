@@ -1,0 +1,12 @@
+fn say(str mens)>
+    Console.Log(mens)
+
+fn main()>
+    @manual//gestion de memoria manual
+    str mens = "hello world!!!"
+    mens.reserv() //reservar memoria
+    say(mens.prest())// prestar la variable
+
+
+fn finish()>
+    mens.free()//liberar memoria
