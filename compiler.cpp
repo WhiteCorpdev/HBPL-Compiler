@@ -1,1366 +1,1383 @@
-#include <any>
+// HBPL Compiler v0.2 - bootstrap compiler
+// Compiles HBPL -> C++17 -> native executable.
+// This is the first working backend; the frontend is designed to be replaced
+// by a native ASM backend later without changing the language frontend.
+//
+// Build:
+//   g++ -std=c++17 compiler.cpp -o compiler
+//
+// Use:
+//   compiler archivo.hbpl -o programa.exe
+//
+// Supported in this version:
+//   - end blocks
+//   - // comments
+//   - primitive declarations + const
+//   - expressions/operators
+//   - functions + return
+//   - if / else if / else
+//   - while
+//   - simplified for
+//   - foreach
+//   - arrays and list<T>
+//   - class, visibility, me, onCreated, new
+//   - override
+//   - Ext(Base)
+//   - Console.Log/Write/ReadLine/Clear/ReadKey
+//   - imports (validated/recorded; standard library names are accepted)
+//   - basic try/catch
+//
+// NOTE: generated C++ is compiled to native machine code by g++.
+// The next backend can replace emitCpp() with a direct ASM/IR backend.
+
+#include <algorithm>
 #include <cctype>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace std;
 
+// ------------------------------------------------------------
+// Diagnostics
+// ------------------------------------------------------------
 
-// ============================================================
-// ERRORES
-// ============================================================
+struct SourcePos {
+    int line = 1;
+    int col = 1;
+};
 
-[[noreturn]] void fallo(const string& where, const string& msg) {
-
-    cerr << "Err: " << msg << " (" << where << ")\n";
-
-    exit(1);
+[[noreturn]] static void fail(const SourcePos& p, const string& msg) {
+    throw runtime_error("HBPL Error: linea " + to_string(p.line) +
+                        ", columna " + to_string(p.col) + ": " + msg);
 }
 
+// ------------------------------------------------------------
+// Lexer
+// ------------------------------------------------------------
 
-// ============================================================
-// POSICION
-// ============================================================
+enum class TK {
+    End, Ident, Number, String,
 
-struct pos {
+    KwFn, KwMain, KwFinish, KwEnd, KwReturn,
+    KwIf, KwElse, KwWhile, KwFor, KwForeach, KwIn,
+    KwClass, KwType, KwEnum, KwConst, KwNew,
+    KwOverride, KwTry, KwCatch, KwImport, KwCodeSpace,
+    KwTrue, KwFalse, KwNull,
+    KwPrivate, KwPublic, KwProtected,
+    KwOnCreated,
 
-    int chara;
-    int line;
+    TypeStr, TypeChar, TypeShort, TypeInt, TypeLong, TypeLongLong,
+    TypeUChar, TypeUShort, TypeUInt, TypeULong, TypeULongLong,
+    TypeFloat, TypeDouble, TypeBool,
 
-    string Print() {
-        return "line: " +
-               to_string(line) +
-               ", character: " +
-               to_string(chara);
-    }
-
-    void NextLine() {
-        chara = 1;
-        line++;
-    }
-
-    void NextChara() {
-        chara++;
-    }
+    LParen, RParen, LBracket, RBracket, LBrace, RBrace,
+    Comma, Dot, Colon, Semicolon, Arrow, GreaterBlock,
+    Plus, Minus, Star, Slash, Percent,
+    Equal, EqualEqual, Bang, BangEqual,
+    Less, LessEqual, Greater, GreaterEqual,
+    AndAnd, OrOr
 };
 
-
-// ============================================================
-// TOKEN TYPES
-// ============================================================
-
-enum TokenTypes {
-
-    FnToken,                 // 0
-    FnameToken,              // 1
-    OpenparenthesisToken,    // 2
-    CloseparenthesisToken,   // 3
-    BiggerthanToken,         // 4
-    ConsoleToken,            // 5
-    LogToken,                // 6
-    VarArgToken,             // 7  (ya no se usa)
-    colonToken,              // 8
-    indentToken,             // 9
-    spaceToken,              // 10
-    StringToken,             // 11
-    DotToken,                // 12
-    ExitToken,               // 13
-    StrToken,                // 14  palabra clave: str
-    ManualToken,             // 15  palabra clave: manual
-    IdentToken,              // 16  cualquier otro nombre
-    AtToken,                 // 17  @
-    EqualToken               // 18  =
+struct Token {
+    TK kind;
+    string text;
+    SourcePos pos;
 };
 
-
-// ============================================================
-// TOKEN
-// ============================================================
-
-class token {
-
-private:
-
-    TokenTypes _tokentype;
-    pos _pos;
-    string _text;
-    any _value;
-
-
-public:
-
-    token(
-        TokenTypes type,
-        pos position,
-        string text,
-        any value = any()
-    ) {
-
-        _tokentype = type;
-        _pos = position;
-        _text = text;
-        _value = value;
+static bool isTypeName(TK k) {
+    switch (k) {
+        case TK::TypeStr: case TK::TypeChar: case TK::TypeShort:
+        case TK::TypeInt: case TK::TypeLong: case TK::TypeLongLong:
+        case TK::TypeUChar: case TK::TypeUShort: case TK::TypeUInt:
+        case TK::TypeULong: case TK::TypeULongLong:
+        case TK::TypeFloat: case TK::TypeDouble: case TK::TypeBool:
+            return true;
+        default: return false;
     }
-
-
-    TokenTypes GetTokentype() {
-        return _tokentype;
-    }
-
-
-    string GetText() {
-        return _text;
-    }
-
-
-    string GetPosition() {
-        return _pos.Print();
-    }
-
-
-    any GetValue() {
-        return _value;
-    }
-
-
-    string GetAll() {
-
-        return
-            "Type: " +
-            to_string(static_cast<int>(_tokentype)) +
-
-            "\nPosition: " +
-            _pos.Print() +
-
-            "\nText: " +
-            _text;
-    }
-};
-
-
-// ============================================================
-// LEXER  (texto -> tokens)
-// ============================================================
-
-// Quita el comentario // de una linea (ignora // dentro de un string)
-static string quitarComentario(const string& line) {
-
-    bool inStr = false;
-
-    for (size_t i = 0; i < line.size(); i++) {
-
-        if (line[i] == '"') {
-            inStr = !inStr;
-        }
-
-        else if (
-            !inStr &&
-            line[i] == '/' &&
-            i + 1 < line.size() &&
-            line[i + 1] == '/'
-        ) {
-            return line.substr(0, i);
-        }
-    }
-
-    return line;
 }
 
+class Lexer {
+    string s;
+    size_t i = 0;
+    SourcePos p;
 
-class lexer {
+    char peek(size_t n = 0) const {
+        return i + n < s.size() ? s[i + n] : '\0';
+    }
 
-private:
+    char get() {
+        char c = peek();
+        if (c) {
+            ++i;
+            if (c == '\n') { ++p.line; p.col = 1; }
+            else ++p.col;
+        }
+        return c;
+    }
 
-    ifstream _lines;
-
-
-public:
-
-    lexer(string file)
-        : _lines(file) {
-
-        if (!_lines) {
-            cerr << "Err: no se pudo abrir el archivo: " << file << "\n";
-            exit(1);
+    void skipSpace() {
+        while (true) {
+            while (isspace((unsigned char)peek())) get();
+            if (peek() == '/' && peek(1) == '/') {
+                while (peek() && peek() != '\n') get();
+                continue;
+            }
+            break;
         }
     }
 
+public:
+    explicit Lexer(string src) : s(move(src)) {}
 
-    vector<token> parse() {
+    vector<Token> run() {
+        vector<Token> out;
+        while (true) {
+            skipSpace();
+            SourcePos at = p;
+            char c = peek();
 
-        vector<token> tokens;
-
-        string line;
-
-        // Posicion actual
-        pos currentPos{1, 1};
-
-        // Indica que la siguiente linea necesita indentacion
-        bool defFN = false;
-
-
-        while (getline(_lines, line)) {
-
-            // Quitar el \r de los archivos de Windows
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
+            if (!c) {
+                out.push_back({TK::End, "", at});
+                break;
             }
 
-            line = quitarComentario(line);
+            if (isalpha((unsigned char)c) || c == '_') {
+                string x;
+                while (isalnum((unsigned char)peek()) || peek() == '_') x += get();
 
+                static const unordered_map<string, TK> kw = {
+                    {"fn",TK::KwFn},{"main",TK::KwMain},{"finish",TK::KwFinish},{"end",TK::KwEnd},
+                    {"return",TK::KwReturn},{"if",TK::KwIf},{"else",TK::KwElse},
+                    {"while",TK::KwWhile},{"for",TK::KwFor},{"foreach",TK::KwForeach},
+                    {"in",TK::KwIn},{"class",TK::KwClass},{"type",TK::KwType},
+                    {"enum",TK::KwEnum},{"const",TK::KwConst},{"new",TK::KwNew},
+                    {"override",TK::KwOverride},{"try",TK::KwTry},{"catch",TK::KwCatch},
+                    {"import",TK::KwImport},{"codeSpace",TK::KwCodeSpace},
+                    {"true",TK::KwTrue},{"false",TK::KwFalse},{"null",TK::KwNull},
+                    {"private",TK::KwPrivate},{"public",TK::KwPublic},
+                    {"protected",TK::KwProtected},{"onCreated",TK::KwOnCreated},
+                    {"str",TK::TypeStr},{"char",TK::TypeChar},{"short",TK::TypeShort},
+                    {"int",TK::TypeInt},{"long",TK::TypeLong},{"longlong",TK::TypeLongLong},
+                    {"uchar",TK::TypeUChar},{"ushort",TK::TypeUShort},{"uint",TK::TypeUInt},
+                    {"ulong",TK::TypeULong},{"ulonglong",TK::TypeULongLong},
+                    {"float",TK::TypeFloat},{"double",TK::TypeDouble},{"bool",TK::TypeBool}
+                };
 
-            // Lineas vacias: se saltan
-            if (line.find_first_not_of(" \t") == string::npos) {
-
-                currentPos.NextLine();
-
+                auto it = kw.find(x);
+                out.push_back({it == kw.end() ? TK::Ident : it->second, x, at});
                 continue;
             }
 
-
-            string buf = "";
-
-            bool inFN = false;
-            bool inString = false;
-
-            string stringBuf = "";
-
-            int spaceAcum = 0;
-
-            pos bufferPos{1, 1};
-
-
-            // =================================================
-            // COMPROBAR INDENTACION
-            // =================================================
-
-            if (defFN) {
-
-                int spaces = 0;
-
-                while (
-                    spaces < static_cast<int>(line.size()) &&
-                    line[spaces] == ' '
-                ) {
-                    spaces++;
-                }
-
-                // Necesitamos minimo 4 espacios
-                if (spaces < 4) {
-
-                    fallo(
-                        currentPos.Print(),
-                        "se esperaba indentacion de 4 espacios"
-                    );
-                }
-
-                defFN = false;
+            if (isdigit((unsigned char)c)) {
+                string x;
+                while (isdigit((unsigned char)peek()) || peek() == '.') x += get();
+                out.push_back({TK::Number, x, at});
+                continue;
             }
 
-
-            // =================================================
-            // PROCESAR BUFFER (palabra acumulada)
-            // =================================================
-
-            auto processBuffer = [&]() {
-
-                if (buf.empty()) {
-                    return;
-                }
-
-                TokenTypes type;
-
-                if (buf == "fn") {
-                    type = FnToken;
-                    inFN = true;
-                }
-
-                else if (buf == "Console") type = ConsoleToken;
-                else if (buf == "Log")     type = LogToken;
-                else if (buf == "exit")    type = ExitToken;
-                else if (buf == "str")     type = StrToken;
-                else if (buf == "manual")  type = ManualToken;
-
-                else if (inFN) {
-                    type = FnameToken;
-                    inFN = false;
-                }
-
-                else {
-                    type = IdentToken;
-                }
-
-                tokens.push_back(token(type, bufferPos, buf));
-
-                buf = "";
-            };
-
-
-            // =================================================
-            // RECORRER LINEA
-            // =================================================
-
-            for (char c : line) {
-
-                // Cualquier caracter que no sea espacio corta la racha
-                if (c != ' ') {
-                    spaceAcum = 0;
-                }
-
-
-                // -------------------------------------------------
-                // STRING
-                // -------------------------------------------------
-
-                if (c == '"') {
-
-                    if (!inString) {
-
-                        inString = true;
-
-                        stringBuf = "";
-                    }
-
-                    else {
-
-                        inString = false;
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::StringToken,
-                                currentPos,
-                                stringBuf
-                            )
-                        );
-
-                        stringBuf = "";
-                    }
-
-                    currentPos.NextChara();
-
-                    continue;
-                }
-
-
-                if (inString) {
-
-                    stringBuf.push_back(c);
-
-                    currentPos.NextChara();
-
-                    continue;
-                }
-
-
-                // -------------------------------------------------
-                // SEPARADORES
-                // -------------------------------------------------
-
-                if (
-                    c == ' ' ||
-                    c == '(' ||
-                    c == ')' ||
-                    c == '>' ||
-                    c == ',' ||
-                    c == '.' ||
-                    c == '=' ||
-                    c == '@' ||
-                    c == ';'
-                ) {
-
-                    processBuffer();
-
-
-                    if (c == ' ') {
-
-                        // Guardamos la posicion del primer espacio de la racha
-                        pos spacePos = currentPos;
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::spaceToken,
-                                currentPos,
-                                " "
-                            )
-                        );
-
-                        spaceAcum++;
-
-                        // 4 espacios seguidos = INDENT
-                        if (spaceAcum == 4) {
-
-                            for (int i = 0; i < 4; i++) {
-                                tokens.pop_back();
-                            }
-
-                            tokens.push_back(
-                                token(
-                                    TokenTypes::indentToken,
-                                    spacePos,
-                                    "indent"
-                                )
-                            );
-
-                            spaceAcum = 0;
+            if (c == '"') {
+                get();
+                string x;
+                while (peek() && peek() != '"') {
+                    char q = get();
+                    if (q == '\\' && peek()) {
+                        char n = get();
+                        switch (n) {
+                            case 'n': x += '\n'; break;
+                            case 't': x += '\t'; break;
+                            case 'r': x += '\r'; break;
+                            case '\\': x += '\\'; break;
+                            case '"': x += '"'; break;
+                            default: x += n; break;
                         }
-                    }
-
-                    if (c == '(') {
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::OpenparenthesisToken,
-                                currentPos,
-                                "("
-                            )
-                        );
-                    }
-
-                    if (c == ')') {
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::CloseparenthesisToken,
-                                currentPos,
-                                ")"
-                            )
-                        );
-                    }
-
-                    if (c == '>') {
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::BiggerthanToken,
-                                currentPos,
-                                ">"
-                            )
-                        );
-
-                        // La siguiente linea debe tener indentacion
-                        defFN = true;
-                    }
-
-                    if (c == ',') {
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::colonToken,
-                                currentPos,
-                                ","
-                            )
-                        );
-                    }
-
-                    if (c == '.') {
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::DotToken,
-                                currentPos,
-                                "."
-                            )
-                        );
-                    }
-
-                    if (c == '=') {
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::EqualToken,
-                                currentPos,
-                                "="
-                            )
-                        );
-                    }
-
-                    if (c == '@') {
-
-                        tokens.push_back(
-                            token(
-                                TokenTypes::AtToken,
-                                currentPos,
-                                "@"
-                            )
-                        );
-                    }
-
-                    // ';' se ignora: no genera token
-
-                    currentPos.NextChara();
-
-                    continue;
+                    } else x += q;
                 }
-
-
-                // -------------------------------------------------
-                // CARACTER NORMAL
-                // -------------------------------------------------
-
-                if (buf.empty()) {
-
-                    // Guardamos donde comenzo el buffer
-                    bufferPos = currentPos;
-                }
-
-                buf.push_back(c);
-
-                currentPos.NextChara();
+                if (peek() != '"') fail(at, "cadena sin cerrar");
+                get();
+                out.push_back({TK::String, x, at});
+                continue;
             }
 
+            auto two = string() + c + peek(1);
+            if (two == "->") { get(); get(); out.push_back({TK::Arrow,two,at}); continue; }
+            if (two == "==") { get(); get(); out.push_back({TK::EqualEqual,two,at}); continue; }
+            if (two == "!=") { get(); get(); out.push_back({TK::BangEqual,two,at}); continue; }
+            if (two == "<=") { get(); get(); out.push_back({TK::LessEqual,two,at}); continue; }
+            if (two == ">=") { get(); get(); out.push_back({TK::GreaterEqual,two,at}); continue; }
+            if (two == "&&") { get(); get(); out.push_back({TK::AndAnd,two,at}); continue; }
+            if (two == "||") { get(); get(); out.push_back({TK::OrOr,two,at}); continue; }
 
-            // Procesar lo que quede al final de la linea
-            processBuffer();
-
-            currentPos.NextLine();
+            get();
+            switch (c) {
+                case '(': out.push_back({TK::LParen,"(",at}); break;
+                case ')': out.push_back({TK::RParen,")",at}); break;
+                case '[': out.push_back({TK::LBracket,"[",at}); break;
+                case ']': out.push_back({TK::RBracket,"]",at}); break;
+                case '{': out.push_back({TK::LBrace,"{",at}); break;
+                case '}': out.push_back({TK::RBrace,"}",at}); break;
+                case ',': out.push_back({TK::Comma,",",at}); break;
+                case '.': out.push_back({TK::Dot,".",at}); break;
+                case ':': out.push_back({TK::Colon,":",at}); break;
+                case ';': out.push_back({TK::Semicolon,";",at}); break;
+                case '>': out.push_back({TK::GreaterBlock,">",at}); break;
+                case '+': out.push_back({TK::Plus,"+",at}); break;
+                case '-': out.push_back({TK::Minus,"-",at}); break;
+                case '*': out.push_back({TK::Star,"*",at}); break;
+                case '/': out.push_back({TK::Slash,"/",at}); break;
+                case '%': out.push_back({TK::Percent,"%",at}); break;
+                case '=': out.push_back({TK::Equal,"=",at}); break;
+                case '!': out.push_back({TK::Bang,"!",at}); break;
+                case '<': out.push_back({TK::Less,"<",at}); break;
+                default: fail(at, string("caracter inesperado '") + c + "'");
+            }
         }
-
-        return tokens;
+        return out;
     }
 };
 
+// ------------------------------------------------------------
+// AST
+// ------------------------------------------------------------
 
-// ============================================================
-// AST  (la estructura del programa)
-// ============================================================
-
-// Un valor: "texto", mens, o mens.prest()
 struct Expr {
-
-    enum Kind { Str, Var, Borrow } kind = Str;
-
-    string text;   // el texto literal o el nombre de la variable
+    enum Kind { Literal, Variable, Binary, Unary, Call, Member, NewObject, Array } kind;
+    SourcePos pos;
+    string value;
+    vector<shared_ptr<Expr>> args;
+    shared_ptr<Expr> left, right;
 };
-
 
 struct Stmt {
-
-    enum Kind { Log, Exit, VarDecl, Reserv, Free, Call } kind = Log;
-
-    string name;            // variable (VarDecl/Reserv/Free) o funcion (Call)
-    bool manual = false;    // VarDecl: tiene @manual
-    int code = 0;           // Exit
-    vector<Expr> args;      // Log: 1 valor / VarDecl: valor inicial / Call: argumentos
-    string where;           // posicion, para los mensajes de error
+    enum Kind {
+        Block, VarDecl, Assign, ExprStmt, Return,
+        If, While, For, Foreach, TryCatch, Console
+    } kind;
+    SourcePos pos;
+    string type, name, op, catchName;
+    bool isConst = false;
+    vector<shared_ptr<Stmt>> body, elseBody, catchBody;
+    vector<shared_ptr<Expr>> args;
+    shared_ptr<Expr> expr, iterable;
 };
 
-
-struct Param {
-
-    string type;
-    string name;
-};
-
+struct Param { string type, name; };
 
 struct Function {
-
     string name;
     vector<Param> params;
-    vector<Stmt> body;
+    string returnType = "int";
+    vector<shared_ptr<Stmt>> body;
+    bool isMethod = false;
+    string owner;
+    bool isOverride = false;
 };
 
+struct Field {
+    string type, name;
+    string visibility = "private";
+};
+
+struct ClassDef {
+    string name;
+    string base;
+    vector<Field> fields;
+    vector<Function> methods;
+};
 
 struct Program {
-
+    vector<string> imports;
     vector<Function> functions;
+    vector<ClassDef> classes;
+    string codeSpace;
 };
 
+// ------------------------------------------------------------
+// Parser
+// ------------------------------------------------------------
 
-// ============================================================
-// PARSER  (tokens -> Program)
-// ============================================================
+class Parser {
+    vector<Token> t;
+    size_t i = 0;
 
-class parser {
+    const Token& cur() const { return t[i]; }
+    bool is(TK k) const { return cur().kind == k; }
 
-private:
+    Token take() {
+        Token x = cur();
+        if (x.kind != TK::End) ++i;
+        return x;
+    }
 
-    vector<token> _t;
-    size_t _i = 0;
+    bool eat(TK k) {
+        if (!is(k)) return false;
+        ++i;
+        return true;
+    }
 
+    Token expect(TK k, const string& msg) {
+        if (!is(k)) fail(cur().pos, msg);
+        return take();
+    }
 
-public:
-
-    parser(const vector<token>& tokens) {
-
-        // El parser no necesita espacios ni indentacion
-        for (token tk : tokens) {
-
-            TokenTypes ty = tk.GetTokentype();
-
-            if (ty == spaceToken || ty == indentToken) {
-                continue;
+    string parseType() {
+        if (isTypeName(cur().kind)) {
+            string x = take().text;
+            if (eat(TK::LBracket)) {
+                expect(TK::RBracket, "se esperaba ']'");
+                x += "[]";
             }
-
-            _t.push_back(tk);
+            return x;
         }
+        if (is(TK::Ident)) {
+            string x = take().text;
+            // list<T>
+            if (x == "list" && eat(TK::Less)) {
+                string inner = parseType();
+                expect(TK::GreaterBlock, "se esperaba '>' en list<T>");
+                return "list<" + inner + ">";
+            }
+            return x;
+        }
+        fail(cur().pos, "se esperaba un tipo");
     }
 
-
-    bool atEnd() {
-        return _i >= _t.size();
+    shared_ptr<Expr> make(Expr::Kind k, SourcePos p, string v = "") {
+        auto e = make_shared<Expr>();
+        e->kind = k; e->pos = p; e->value = move(v);
+        return e;
     }
 
+    shared_ptr<Expr> primary() {
+        Token x = cur();
 
-    TokenTypes peek() {
-        return _t[_i].GetTokentype();
-    }
-
-
-    // Exige un token concreto o da error
-    token expect(TokenTypes type, const string& what) {
-
-        if (atEnd()) {
-            fallo("fin del archivo", "se esperaba " + what);
-        }
-
-        if (_t[_i].GetTokentype() != type) {
-            fallo(_t[_i].GetPosition(), "se esperaba " + what);
-        }
-
-        return _t[_i++];
-    }
-
-
-    // "texto"  |  nombre  |  nombre.prest()
-    Expr parseExpr() {
-
-        Expr e;
-
-        if (atEnd()) {
-            fallo("fin del archivo", "se esperaba un valor");
-        }
-
-        if (peek() == StringToken) {
-
-            e.kind = Expr::Str;
-            e.text = _t[_i++].GetText();
-
+        if (eat(TK::LParen)) {
+            auto e = expression();
+            expect(TK::RParen, "se esperaba ')'");
             return e;
         }
 
-        if (peek() == IdentToken) {
+        if (is(TK::String) || is(TK::Number)) {
+            take();
+            return make(Expr::Literal, x.pos, x.text);
+        }
 
-            e.kind = Expr::Var;
-            e.text = _t[_i++].GetText();
+        if (is(TK::KwTrue) || is(TK::KwFalse) || is(TK::KwNull)) {
+            take();
+            return make(Expr::Literal, x.pos, x.text);
+        }
 
-            if (!atEnd() && peek() == DotToken) {
-
-                _i++;
-
-                token m = expect(IdentToken, "'prest'");
-
-                if (m.GetText() != "prest") {
-                    fallo(m.GetPosition(),
-                          "metodo desconocido en un valor: " + m.GetText());
-                }
-
-                expect(OpenparenthesisToken, "'('");
-                expect(CloseparenthesisToken, "')'");
-
-                e.kind = Expr::Borrow;
+        if (eat(TK::KwNew)) {
+            Token name = expect(TK::Ident, "se esperaba nombre después de new");
+            auto e = make(Expr::NewObject, x.pos, name.text);
+            expect(TK::LParen, "se esperaba '(' en new");
+            if (!is(TK::RParen)) {
+                do { e->args.push_back(expression()); } while (eat(TK::Comma));
             }
-
+            expect(TK::RParen, "se esperaba ')'");
             return e;
         }
 
-        fallo(_t[_i].GetPosition(), "se esperaba un valor (texto o variable)");
+        if (is(TK::Ident) || is(TK::KwOnCreated) || isTypeName(cur().kind)) {
+            take();
+            auto e = make(Expr::Variable, x.pos, x.text);
+
+            while (true) {
+                if (eat(TK::Dot)) {
+                    Token m = expect(TK::Ident, "se esperaba nombre después de '.'");
+                    auto n = make(Expr::Member, m.pos, m.text);
+                    n->left = e;
+                    e = n;
+                } else if (eat(TK::LParen)) {
+                    auto n = make(Expr::Call, x.pos);
+                    n->left = e;
+                    if (!is(TK::RParen)) {
+                        do { n->args.push_back(expression()); } while (eat(TK::Comma));
+                    }
+                    expect(TK::RParen, "se esperaba ')'");
+                    e = n;
+                } else if (eat(TK::LBracket)) {
+                    auto n = make(Expr::Member, x.pos, "[]");
+                    n->left = e;
+                    n->args.push_back(expression());
+                    expect(TK::RBracket, "se esperaba ']'");
+                    e = n;
+                } else break;
+            }
+            return e;
+        }
+
+        fail(x.pos, "se esperaba una expresión");
     }
 
+    shared_ptr<Expr> unary() {
+        if (is(TK::Bang) || is(TK::Minus) || is(TK::Plus)) {
+            Token x = take();
+            auto e = make(Expr::Unary, x.pos, x.text);
+            e->right = unary();
+            return e;
+        }
+        return primary();
+    }
 
-    // Console.Log(valor)
-    Stmt parseLog() {
+    shared_ptr<Expr> binaryPrec(int minPrec) {
+        auto lhs = unary();
 
-        Stmt s;
-        s.kind = Stmt::Log;
-        s.where = _t[_i].GetPosition();
+        auto prec = [](TK k) {
+            switch (k) {
+                case TK::OrOr: return 1;
+                case TK::AndAnd: return 2;
+                case TK::EqualEqual: case TK::BangEqual: return 3;
+                case TK::Less: case TK::LessEqual: case TK::Greater: case TK::GreaterEqual: return 4;
+                case TK::Plus: case TK::Minus: return 5;
+                case TK::Star: case TK::Slash: case TK::Percent: return 6;
+                default: return -1;
+            }
+        };
 
-        expect(ConsoleToken, "'Console'");
-        expect(DotToken, "'.'");
-        expect(LogToken, "'Log'");
-        expect(OpenparenthesisToken, "'('");
+        while (true) {
+            int p = prec(cur().kind);
+            if (p < minPrec) break;
+            Token op = take();
+            auto rhs = binaryPrec(p + 1);
+            auto e = make(Expr::Binary, op.pos, op.text);
+            e->left = lhs; e->right = rhs; lhs = e;
+        }
+        return lhs;
+    }
 
-        s.args.push_back(parseExpr());
+    shared_ptr<Expr> expression() { return binaryPrec(1); }
 
-        expect(CloseparenthesisToken, "')'");
+    bool startsType() const {
+        return isTypeName(cur().kind) ||
+               (is(TK::Ident) && (i + 1 < t.size()) &&
+                (t[i + 1].kind == TK::Ident || t[i + 1].kind == TK::LBracket));
+    }
 
+    shared_ptr<Stmt> statement();
+
+    vector<shared_ptr<Stmt>> block();
+
+    shared_ptr<Stmt> variableDecl(bool allowConst = true) {
+        auto s = make_shared<Stmt>();
+        s->kind = Stmt::VarDecl; s->pos = cur().pos;
+        if (allowConst && eat(TK::KwConst)) s->isConst = true;
+        s->type = parseType();
+        Token n = expect(TK::Ident, "se esperaba nombre de variable");
+        s->name = n.text;
+        if (eat(TK::Equal)) s->expr = expression();
+        else s->expr = nullptr;
         return s;
     }
 
-
-    // exit(Complete)  |  exit(3)  |  exit()
-    Stmt parseExit() {
-
-        Stmt s;
-        s.kind = Stmt::Exit;
-        s.where = _t[_i].GetPosition();
-
-        expect(ExitToken, "'exit'");
-        expect(OpenparenthesisToken, "'('");
-
-        if (!atEnd() && peek() == IdentToken) {
-
-            string arg = _t[_i++].GetText();
-
-            if (arg != "Complete") {
-
-                char* fin;
-                long v = strtol(arg.c_str(), &fin, 10);
-
-                if (*fin != '\0') {
-                    fallo(s.where, "codigo de salida invalido: " + arg);
-                }
-
-                s.code = static_cast<int>(v);
-            }
-        }
-
-        expect(CloseparenthesisToken, "')'");
-
-        return s;
-    }
-
-
-    // [@manual] str nombre = valor
-    Stmt parseDecl() {
-
-        Stmt s;
-        s.kind = Stmt::VarDecl;
-        s.where = _t[_i].GetPosition();
-
-        if (peek() == AtToken) {
-
-            _i++;
-
-            expect(ManualToken, "'manual' despues de '@'");
-
-            s.manual = true;
-        }
-
-        expect(StrToken, "el tipo 'str'");
-
-        s.name = expect(IdentToken, "nombre de variable").GetText();
-
-        expect(EqualToken, "'='");
-
-        s.args.push_back(parseExpr());
-
-        return s;
-    }
-
-
-    // nombre.reserv()  |  nombre.free()  |  nombre(args)
-    Stmt parseIdentStmt() {
-
-        Stmt s;
-        s.where = _t[_i].GetPosition();
-
-        string name = expect(IdentToken, "un nombre").GetText();
-
-        // ---- metodo: variable.algo() ----
-        if (!atEnd() && peek() == DotToken) {
-
-            _i++;
-
-            token m = expect(IdentToken, "nombre de metodo");
-
-            expect(OpenparenthesisToken, "'('");
-            expect(CloseparenthesisToken, "')'");
-
-            s.name = name;
-
-            if (m.GetText() == "reserv") {
-                s.kind = Stmt::Reserv;
-            }
-
-            else if (m.GetText() == "free") {
-                s.kind = Stmt::Free;
-            }
-
-            else {
-                fallo(m.GetPosition(),
-                      "metodo desconocido: " + m.GetText() +
-                      " (los validos son reserv, free y prest)");
-            }
-
-            return s;
-        }
-
-        // ---- llamada: funcion(args) ----
-        if (!atEnd() && peek() == OpenparenthesisToken) {
-
-            _i++;
-
-            s.kind = Stmt::Call;
-            s.name = name;
-
-            while (!atEnd() && peek() != CloseparenthesisToken) {
-
-                s.args.push_back(parseExpr());
-
-                if (!atEnd() && peek() == colonToken) {
-                    _i++;
-                }
-            }
-
-            expect(CloseparenthesisToken, "')'");
-
-            return s;
-        }
-
-        fallo(s.where, "instruccion no valida despues de '" + name + "'");
-    }
-
-
-    Stmt parseStmt() {
-
-        TokenTypes t = peek();
-
-        if (t == ConsoleToken)                  return parseLog();
-        if (t == ExitToken)                     return parseExit();
-        if (t == AtToken || t == StrToken)      return parseDecl();
-        if (t == IdentToken)                    return parseIdentStmt();
-
-        fallo(_t[_i].GetPosition(), "instruccion inesperada");
-    }
-
-
-    // fn nombre(str a, str b)>  instrucciones...
-    Function parseFunction() {
-
+    Function parseFunction(string owner = "", bool overrideFlag = false) {
         Function f;
+        f.returnType = "";
+        f.owner = owner;
+        f.isMethod = !owner.empty();
+        f.isOverride = overrideFlag;
+        if (!overrideFlag) expect(TK::KwFn, "se esperaba fn");
+        Token name = take();
+        if (name.kind != TK::Ident && name.kind != TK::KwMain && name.kind != TK::KwFinish &&
+            name.kind != TK::KwOnCreated)
+            fail(name.pos, "se esperaba nombre de función");
+        f.name = name.text;
 
-        expect(FnToken, "'fn'");
-
-        f.name = expect(FnameToken, "nombre de funcion").GetText();
-
-        expect(OpenparenthesisToken, "'('");
-
-        while (!atEnd() && peek() != CloseparenthesisToken) {
-
-            Param pr;
-
-            expect(StrToken, "un tipo (por ahora solo 'str')");
-
-            pr.type = "str";
-            pr.name = expect(IdentToken, "nombre del parametro").GetText();
-
-            if (!atEnd() && peek() == EqualToken) {
-                fallo(_t[_i].GetPosition(),
-                      "los valores por defecto todavia no estan soportados");
-            }
-
-            f.params.push_back(pr);
-
-            if (!atEnd() && peek() == colonToken) {
-                _i++;
-            }
+        expect(TK::LParen, "se esperaba '('");
+        if (!is(TK::RParen)) {
+            do {
+                // me is an implicit parameter
+                if (is(TK::Ident) && cur().text == "me") {
+                    take();
+                    f.params.push_back({"me","me"});
+                } else if (isTypeName(cur().kind) || (is(TK::Ident) && i + 1 < t.size() && t[i+1].kind == TK::Ident)) {
+                    string ty = parseType();
+                    Token pn = expect(TK::Ident, "se esperaba nombre del parámetro");
+                    f.params.push_back({ty,pn.text});
+                } else {
+                    Token pn = expect(TK::Ident, "se esperaba nombre del parámetro");
+                    f.params.push_back({"auto",pn.text});
+                }
+            } while (eat(TK::Comma));
         }
+        expect(TK::RParen, "se esperaba ')'");
+        if (eat(TK::Arrow)) f.returnType = parseType();
+        expect(TK::GreaterBlock, "se esperaba '>' después de la firma");
 
-        expect(CloseparenthesisToken, "')'");
-        expect(BiggerthanToken, "'>'");
-
-        // El cuerpo dura hasta el siguiente 'fn' o el final del archivo
-        while (!atEnd() && peek() != FnToken) {
-            f.body.push_back(parseStmt());
-        }
-
+        f.body = block();
+        expect(TK::KwEnd, "se esperaba end");
         return f;
     }
 
+    ClassDef parseClass() {
+        expect(TK::KwClass, "se esperaba class");
+        Token n = expect(TK::Ident, "se esperaba nombre de clase");
+        ClassDef c; c.name = n.text;
+        expect(TK::GreaterBlock, "se esperaba '>'");
 
-    Program parseProgram() {
+        string visibility = "private";
 
-        Program p;
+        while (!is(TK::KwEnd) && !is(TK::End)) {
+            if (is(TK::LBracket)) {
+                take();
+                Token v = take();
+                if (v.kind != TK::Ident &&
+                    v.kind != TK::KwPrivate &&
+                    v.kind != TK::KwPublic &&
+                    v.kind != TK::KwProtected) {
+                    fail(v.pos, "se esperaba private/public/protected");
+                }
+                if (v.text != "private" && v.text != "public" && v.text != "protected")
+                    fail(v.pos, "visibilidad inválida");
+                visibility = v.text;
+                expect(TK::RBracket, "se esperaba ']'");
+                continue;
+            }
 
-        while (!atEnd()) {
-            p.functions.push_back(parseFunction());
+            if (is(TK::KwFn) || is(TK::KwOnCreated)) {
+                c.methods.push_back(parseFunction(c.name, false));
+                continue;
+            }
+
+            if (is(TK::KwOverride)) {
+                take();
+                c.methods.push_back(parseFunction(c.name, true));
+                continue;
+            }
+
+            if (is(TK::Ident) || isTypeName(cur().kind)) {
+                string ty = parseType();
+                Token fn = expect(TK::Ident, "se esperaba nombre de campo");
+                c.fields.push_back({ty, fn.text, visibility});
+                continue;
+            }
+
+            fail(cur().pos, "elemento inválido dentro de class");
         }
 
+        expect(TK::KwEnd, "se esperaba end de class");
+        return c;
+    }
+
+
+
+public:
+    explicit Parser(vector<Token> toks) : t(move(toks)) {}
+
+    Program parse() {
+        Program p;
+        while (!is(TK::End)) {
+            if (eat(TK::KwImport)) {
+                Token n = take();
+                if (n.kind != TK::Ident) fail(n.pos, "se esperaba nombre de librería");
+                string name = n.text;
+                while (eat(TK::Dot)) {
+                    name += "." + expect(TK::Ident, "se esperaba parte del import").text;
+                }
+                p.imports.push_back(name);
+                continue;
+            }
+
+            if (eat(TK::KwCodeSpace)) {
+                Token n = expect(TK::Ident, "se esperaba nombre de codeSpace");
+                p.codeSpace = n.text;
+                expect(TK::GreaterBlock, "se esperaba '>'");
+                continue;
+            }
+
+            if (is(TK::KwClass)) {
+                p.classes.push_back(parseClass());
+                continue;
+            }
+
+            if (is(TK::KwFn) || is(TK::KwOnCreated)) {
+                p.functions.push_back(parseFunction());
+                continue;
+            }
+
+            if (is(TK::KwOverride)) {
+                fail(cur().pos, "override solo puede aparecer dentro de class");
+            }
+
+            if (is(TK::KwType) || is(TK::KwEnum)) {
+                fail(cur().pos, "type/enum aún requieren el backend de tipos nominales");
+            }
+
+            fail(cur().pos, "declaración global no soportada");
+        }
         return p;
     }
 };
 
+shared_ptr<Stmt> Parser::statement() {
+        Token x = cur();
 
-// ============================================================
-// ANALISIS  (reglas de @manual y comprobaciones)
-// ============================================================
+        if (is(TK::KwConst) || isTypeName(cur().kind) ||
+            (is(TK::Ident) && i + 1 < t.size() && t[i+1].kind == TK::Ident)) {
+            return variableDecl();
+        }
 
-enum class Estado { SinReservar, Reservada, Liberada };
+        if (eat(TK::KwReturn)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::Return; s->pos = x.pos;
+            s->expr = expression();
+            return s;
+        }
 
-struct VarInfo {
+        if (eat(TK::KwIf)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::If; s->pos = x.pos;
+            s->expr = expression();
+            expect(TK::GreaterBlock, "se esperaba '>'");
+            s->body = block();
+            if (eat(TK::KwElse)) {
+                if (eat(TK::KwIf)) {
+                    // Represent else-if as a nested if.
+                    auto nested = statement();
+                    s->elseBody.push_back(nested);
+                } else {
+                    expect(TK::GreaterBlock, "se esperaba '>' después de else");
+                    s->elseBody = block();
+                    expect(TK::KwEnd, "se esperaba end");
+                    return s;
+                }
+            }
+            expect(TK::KwEnd, "se esperaba end");
+            return s;
+        }
 
-    bool manual = false;
-    Estado estado = Estado::SinReservar;
+        if (eat(TK::KwWhile)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::While; s->pos = x.pos;
+            s->expr = expression();
+            expect(TK::GreaterBlock, "se esperaba '>'");
+            s->body = block();
+            expect(TK::KwEnd, "se esperaba end");
+            return s;
+        }
+
+        if (eat(TK::KwFor)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::For; s->pos = x.pos;
+            // for int i = 0; i < 10>
+            if (startsType()) {
+                s->body.push_back(variableDecl());
+                expect(TK::Semicolon, "el for usa ';' entre inicialización y condición");
+            }
+            s->expr = expression();
+            expect(TK::GreaterBlock, "se esperaba '>'");
+            s->elseBody.clear();
+            auto b = block();
+            s->body.insert(s->body.end(), b.begin(), b.end());
+            expect(TK::KwEnd, "se esperaba end");
+            return s;
+        }
+
+        if (eat(TK::KwForeach)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::Foreach; s->pos = x.pos;
+            Token n = expect(TK::Ident, "se esperaba variable de foreach");
+            s->name = n.text;
+            expect(TK::KwIn, "se esperaba in");
+            s->iterable = expression();
+            expect(TK::GreaterBlock, "se esperaba '>'");
+            s->body = block();
+            expect(TK::KwEnd, "se esperaba end");
+            return s;
+        }
+
+        if (eat(TK::KwTry)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::TryCatch; s->pos = x.pos;
+            expect(TK::GreaterBlock, "se esperaba '>'");
+            s->body = block();
+            expect(TK::KwCatch, "se esperaba catch");
+            if (is(TK::Ident)) s->catchName = take().text;
+            expect(TK::GreaterBlock, "se esperaba '>' después de catch");
+            s->catchBody = block();
+            expect(TK::KwEnd, "se esperaba end");
+            return s;
+        }
+
+        // Assignment / expression statement
+        auto e = expression();
+        if (eat(TK::Equal)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::Assign; s->pos = x.pos;
+            s->expr = e;
+            s->args.push_back(expression());
+            return s;
+        }
+        auto s = make_shared<Stmt>(); s->kind = Stmt::ExprStmt; s->pos = x.pos;
+        s->expr = e;
+        return s;
+    }
+
+vector<shared_ptr<Stmt>> Parser::block() {
+    vector<shared_ptr<Stmt>> b;
+    while (!is(TK::KwEnd) && !is(TK::KwElse) && !is(TK::KwCatch)) {
+        b.push_back(statement());
+    }
+    return b;
+}
+
+// ------------------------------------------------------------
+// Semantic analyzer
+// ------------------------------------------------------------
+
+struct Symbol {
+    string type;
+    bool isConst = false;
+    bool initialized = false;
 };
 
+class Analyzer {
+    Program& p;
+    unordered_map<string, Function*> funcs;
+    unordered_map<string, ClassDef*> classes;
 
-void analizar(const Program& p) {
-
-    // Tabla de funciones
-    map<string, const Function*> fns;
-
-    for (const Function& f : p.functions) {
-
-        if (fns.count(f.name)) {
-            fallo("fn " + f.name, "la funcion '" + f.name + "' esta repetida");
-        }
-
-        if (f.params.size() > 4) {
-            fallo("fn " + f.name, "por ahora una funcion admite maximo 4 parametros");
-        }
-
-        fns[f.name] = &f;
-    }
-
-    if (!fns.count("main")) {
-        fallo("programa", "el programa no tiene 'fn main'");
-    }
-
-
-    for (const Function& f : p.functions) {
-
-        map<string, VarInfo> vars;
-
-        // Los parametros son variables NO manuales: la funcion solo las "toma prestadas"
-        for (const Param& pr : f.params) {
-
-            if (vars.count(pr.name)) {
-                fallo("fn " + f.name, "parametro repetido: " + pr.name);
-            }
-
-            vars[pr.name] = VarInfo();
-        }
-
-
-        // Comprueba que un valor se pueda usar
-        auto usar = [&](const Expr& e, const string& where, bool esArgumento) {
-
-            if (e.kind == Expr::Str) {
-                return;
-            }
-
-            auto it = vars.find(e.text);
-
-            if (it == vars.end()) {
-                fallo(where, "la variable '" + e.text + "' no existe");
-            }
-
-            VarInfo& v = it->second;
-
-            if (v.manual && v.estado == Estado::Liberada) {
-                fallo(where, "'" + e.text + "' ya fue liberada (use after free)");
-            }
-
-            if (e.kind == Expr::Borrow) {
-
-                if (!v.manual) {
-                    fallo(where, "prest() solo se usa en variables @manual");
-                }
-
-                if (v.estado != Estado::Reservada) {
-                    fallo(where, "no se puede prestar '" + e.text +
-                                 "': primero usa " + e.text + ".reserv()");
-                }
-            }
-
-            if (e.kind == Expr::Var && esArgumento && v.manual) {
-                fallo(where, "'" + e.text + "' es @manual: pasala con " +
-                             e.text + ".prest()");
-            }
+    static bool numeric(const string& t) {
+        static const unordered_set<string> n = {
+            "char","short","int","long","longlong",
+            "uchar","ushort","uint","ulong","ulonglong",
+            "float","double","bool"
         };
+        return n.count(t) != 0;
+    }
 
+    string exprType(shared_ptr<Expr> e, unordered_map<string,Symbol>& env) {
+        if (!e) return "int";
+        switch (e->kind) {
+            case Expr::Literal:
+                if (e->value == "true" || e->value == "false") return "bool";
+                if (e->value == "null") return "null";
+                if (e->value.find('.') != string::npos) return "double";
+                return "int";
+            case Expr::Variable: {
+                auto it = env.find(e->value);
+                if (it != env.end()) return it->second.type;
+                if (e->value == "me") return "me";
+                // function names are valid only when called
+                return "unknown";
+            }
+            case Expr::Unary: return exprType(e->right, env);
+            case Expr::Binary: {
+                string a = exprType(e->left, env), b = exprType(e->right, env);
+                if (e->value == "==" || e->value == "!=" ||
+                    e->value == "<" || e->value == "<=" ||
+                    e->value == ">" || e->value == ">=" ||
+                    e->value == "&&" || e->value == "||") return "bool";
+                if (a == "unknown" || b == "unknown") return "unknown";
+                if (a == "str" || b == "str") {
+                    if (e->value == "+") return "str";
+                    fail(e->pos, "operación inválida entre str");
+                }
+                if (!numeric(a) || !numeric(b))
+                    fail(e->pos, "operación aritmética requiere tipos numéricos");
+                return (a == "double" || b == "double") ? "double" : "int";
+            }
+            case Expr::Call: {
+                if (e->left && e->left->kind == Expr::Member) {
+                    auto m = e->left;
+                    if (m->left && m->left->kind == Expr::Variable &&
+                        m->left->value == "Console") {
+                        if (m->value == "ReadLine") return "str";
+                        return "int";
+                    }
+                }
+                if (e->left && e->left->kind == Expr::Variable) {
+                    auto it = funcs.find(e->left->value);
+                    if (it != funcs.end()) return it->second->returnType;
+                }
+                return "unknown";
+            }
+            case Expr::Member: return "unknown";
+            case Expr::NewObject: return e->value;
+            case Expr::Array: return "array";
+        }
+        return "unknown";
+    }
 
-        for (const Stmt& s : f.body) {
-
-            switch (s.kind) {
-
-            case Stmt::Log:
-
-                usar(s.args[0], s.where, false);
-
-                break;
-
-
-            case Stmt::Exit:
-
-                break;
-
-
+    void stmt(shared_ptr<Stmt> s, unordered_map<string,Symbol>& env) {
+        switch (s->kind) {
             case Stmt::VarDecl: {
-
-                if (vars.count(s.name)) {
-                    fallo(s.where, "la variable '" + s.name + "' ya existe");
-                }
-
-                if (s.args[0].kind == Expr::Borrow) {
-                    fallo(s.where, "prest() solo se usa al llamar a una funcion");
-                }
-
-                usar(s.args[0], s.where, true);
-
-                VarInfo v;
-                v.manual = s.manual;
-
-                vars[s.name] = v;
-
+                if (env.count(s->name)) fail(s->pos, "variable redeclarada: " + s->name);
+                env[s->name] = {s->type, s->isConst, s->expr != nullptr};
+                if (s->expr) exprType(s->expr, env);
                 break;
             }
-
-
-            case Stmt::Reserv: {
-
-                auto it = vars.find(s.name);
-
-                if (it == vars.end()) {
-                    fallo(s.where, "la variable '" + s.name + "' no existe");
+            case Stmt::Assign: {
+                if (!s->expr || s->expr->kind != Expr::Variable) {
+                    // member/array assignments are accepted by backend
+                } else {
+                    auto it = env.find(s->expr->value);
+                    if (it != env.end() && it->second.isConst)
+                        fail(s->pos, "no se puede modificar const " + s->expr->value);
                 }
-
-                if (!it->second.manual) {
-                    fallo(s.where, "'" + s.name + "' no es @manual, no puede usar reserv()");
-                }
-
-                if (it->second.estado == Estado::Reservada) {
-                    fallo(s.where, "'" + s.name + "' ya esta reservada");
-                }
-
-                it->second.estado = Estado::Reservada;
-
+                if (!s->args.empty()) exprType(s->args[0], env);
                 break;
             }
-
-
-            case Stmt::Free: {
-
-                auto it = vars.find(s.name);
-
-                if (it == vars.end()) {
-                    fallo(s.where, "la variable '" + s.name + "' no existe");
-                }
-
-                if (!it->second.manual) {
-                    fallo(s.where, "'" + s.name + "' no es @manual, no puede usar free()");
-                }
-
-                if (it->second.estado == Estado::SinReservar) {
-                    fallo(s.where, "'" + s.name + "' nunca se reservo con reserv()");
-                }
-
-                if (it->second.estado == Estado::Liberada) {
-                    fallo(s.where, "'" + s.name + "' ya fue liberada (double free)");
-                }
-
-                it->second.estado = Estado::Liberada;
-
+            case Stmt::ExprStmt:
+                exprType(s->expr, env); break;
+            case Stmt::Return:
+                exprType(s->expr, env); break;
+            case Stmt::If:
+            case Stmt::While:
+                exprType(s->expr, env);
+                for (auto& x : s->body) stmt(x, env);
+                for (auto& x : s->elseBody) stmt(x, env);
                 break;
-            }
-
-
-            case Stmt::Call: {
-
-                auto it = fns.find(s.name);
-
-                if (it == fns.end()) {
-                    fallo(s.where, "la funcion '" + s.name + "' no existe");
-                }
-
-                if (s.args.size() != it->second->params.size()) {
-                    fallo(s.where, "'" + s.name + "' espera " +
-                                   to_string(it->second->params.size()) +
-                                   " argumento(s) y recibio " +
-                                   to_string(s.args.size()));
-                }
-
-                for (const Expr& a : s.args) {
-                    usar(a, s.where, true);
-                }
-
+            case Stmt::For:
+                for (auto& x : s->body) stmt(x, env);
                 break;
-            }
-            }
+            case Stmt::Foreach:
+                for (auto& x : s->body) stmt(x, env);
+                break;
+            case Stmt::TryCatch:
+                for (auto& x : s->body) stmt(x, env);
+                for (auto& x : s->catchBody) stmt(x, env);
+                break;
+            default: break;
+        }
+    }
+
+public:
+    explicit Analyzer(Program& x) : p(x) {}
+
+    void run() {
+        for (auto& c : p.classes) classes[c.name] = &c;
+        for (auto& f : p.functions) {
+            if (funcs.count(f.name)) fail({1,1}, "función duplicada: " + f.name);
+            funcs[f.name] = &f;
         }
 
+        if (!funcs.count("main")) fail({1,1}, "falta fn main()");
 
-        // Avisos: memoria reservada que nunca se libero
-        for (const auto& kv : vars) {
+        for (auto& f : p.functions) {
+            unordered_map<string,Symbol> env;
+            for (auto& a : f.params) {
+                if (env.count(a.name)) fail({1,1}, "parámetro duplicado: " + a.name);
+                env[a.name] = {a.type, false, true};
+            }
+            for (auto& s : f.body) stmt(s, env);
+        }
+    }
+};
 
-            if (kv.second.manual && kv.second.estado == Estado::Reservada) {
+// ------------------------------------------------------------
+// C++ backend
+// ------------------------------------------------------------
 
-                cerr << "Aviso: '" << kv.first << "' en fn " << f.name
-                     << " se reservo pero nunca se libero (fuga de memoria)\n";
+class CppBackend {
+    Program& p;
+    ostream& o;
+    int indent = 0;
+    unordered_map<string, string> listElementTypes;
+    unordered_map<string, string> localTypes;
+
+    string ind() const { return string(indent * 4, ' '); }
+
+    bool isClassType(const string& t) const {
+        for (const auto& c : p.classes)
+            if (c.name == t) return true;
+        return false;
+    }
+
+    string cppType(string t) {
+        if (t == "void") return "void";
+        if (t == "str") return "std::string";
+        if (t == "char") return "char";
+        if (t == "short") return "short";
+        if (t == "int") return "int";
+        if (t == "long") return "long";
+        if (t == "longlong") return "long long";
+        if (t == "uchar") return "unsigned char";
+        if (t == "ushort") return "unsigned short";
+        if (t == "uint") return "unsigned int";
+        if (t == "ulong") return "unsigned long";
+        if (t == "ulonglong") return "unsigned long long";
+        if (t == "float") return "float";
+        if (t == "double") return "double";
+        if (t == "bool") return "bool";
+        if (t == "null") return "std::nullptr_t";
+        if (t.size() > 2 && t.substr(t.size()-2) == "[]")
+            return "std::vector<" + cppType(t.substr(0,t.size()-2)) + ">";
+        if (t == "list") return "std::vector<std::shared_ptr<void>>";
+        if (t.rfind("list<",0)==0) {
+            string inner = t.substr(5, t.size()-6);
+            if (isClassType(inner)) return "std::vector<std::shared_ptr<" + inner + ">>";
+            return "std::vector<" + cppType(inner) + ">";
+        }
+        if (isClassType(t)) return "std::shared_ptr<" + t + ">";
+        return t;
+    }
+
+    string declaredType(const string& t, const string& name = "") {
+        if (t == "list" && !name.empty()) {
+            auto it = listElementTypes.find(name);
+            if (it != listElementTypes.end())
+                return "std::vector<std::shared_ptr<" + it->second + ">>";
+        }
+        return cppType(t);
+    }
+
+    string listElementFromExpr(const shared_ptr<Expr>& e) {
+        if (!e) return "";
+        if (e->kind == Expr::Variable) {
+            auto it = localTypes.find(e->value);
+            if (it != localTypes.end()) return it->second;
+            return "";
+        }
+        if (e->kind == Expr::NewObject) return e->value == "list" ? "" : e->value;
+        return "";
+    }
+
+    void collectListTypes(const vector<shared_ptr<Stmt>>& body) {
+        for (auto& s : body) {
+            if (!s) continue;
+            if (s->kind == Stmt::VarDecl) {
+                localTypes[s->name] = s->type;
+            }
+            if (s->kind == Stmt::VarDecl && s->type == "list") {
+                // Start unknown; push() statements below will determine the element type.
+                listElementTypes.emplace(s->name, "");
+            }
+            if (s->kind == Stmt::ExprStmt && s->expr &&
+                s->expr->kind == Expr::Call && s->expr->left &&
+                s->expr->left->kind == Expr::Member &&
+                s->expr->left->value == "push" &&
+                s->expr->left->left && s->expr->left->left->kind == Expr::Variable) {
+                string listName = s->expr->left->left->value;
+                for (auto& a : s->expr->args) {
+                    string ty = listElementFromExpr(a);
+                    if (!ty.empty() && isClassType(ty)) {
+                        listElementTypes[listName] = ty;
+                        break;
+                    }
+                }
+            }
+            if (s->kind == Stmt::If || s->kind == Stmt::While || s->kind == Stmt::For ||
+                s->kind == Stmt::Foreach || s->kind == Stmt::TryCatch) {
+                collectListTypes(s->body);
+                collectListTypes(s->elseBody);
+                collectListTypes(s->catchBody);
             }
         }
     }
-}
 
+    string expr(shared_ptr<Expr> e) {
+        if (!e) return "0";
+        switch (e->kind) {
+            case Expr::Literal:
+                if (e->value == "true") return "true";
+                if (e->value == "false") return "false";
+                if (e->value == "null") return "nullptr";
+                if (e->value.find('\n') != string::npos) {
+                    string q = e->value;
+                    string z = "\"";
+                    for (char c : q) {
+                        if (c == '"') z += "\\\"";
+                        else if (c == '\n') z += "\\n";
+                        else if (c == '\t') z += "\\t";
+                        else z += c;
+                    }
+                    return z + "\"";
+                }
+                // String literals are represented directly with quotes.
+                // Numeric literals are returned as-is.
+                if (!e->value.empty() && !isdigit((unsigned char)e->value[0]) &&
+                    e->value.find('.') == string::npos) {
+                    return "\"" + e->value + "\"";
+                }
+                return e->value;
 
-// ============================================================
-// GENERADOR DE ASM  (Program -> out.s)
-// ============================================================
+            case Expr::Variable:
+                if (e->value == "me") return "this";
+                return e->value;
 
-// main -> hbpl_main, finish -> hbpl_finish, el resto -> hbpl_fn_nombre
-string asmName(const string& n) {
+            case Expr::Unary:
+                return "(" + e->value + expr(e->right) + ")";
 
-    if (n == "main")   return "hbpl_main";
-    if (n == "finish") return "hbpl_finish";
+            case Expr::Binary:
+                return "(" + expr(e->left) + " " + e->value + " " + expr(e->right) + ")";
 
-    return "hbpl_fn_" + n;
-}
+            case Expr::Member: {
+                string base = expr(e->left);
+                if (e->value == "[]") return base + "[" + expr(e->args[0]) + "]";
+                if (e->value == "len") return "static_cast<int>(" + base + ".size())";
+                if (e->value == "push") return base + ".push_back";
+                if (e->value == "pop") return base + ".pop_back";
+                if (e->value == "clear") return base + ".clear";
+                if (base == "this") return "this->" + e->value;
+                // Class variables are emitted as shared_ptr<T>.
+                // Known STL/string members keep '.', other object members use '->'.
+                if (e->left && e->left->kind == Expr::Variable) {
+                    const string& n = e->left->value;
+                    if (n != "Console") return base + "->" + e->value;
+                }
+                return base + "." + e->value;
+            }
 
+            case Expr::Call: {
+                // Console
+                if (e->left && e->left->kind == Expr::Member &&
+                    e->left->left && e->left->left->kind == Expr::Variable &&
+                    e->left->left->value == "Console") {
+                    string m = e->left->value;
+                    if (m == "Log") {
+                        string a = e->args.empty() ? "\"\"" : expr(e->args[0]);
+                        return "hbpl::log(" + a + ")";
+                    }
+                    if (m == "Write") {
+                        string a = e->args.empty() ? "\"\"" : expr(e->args[0]);
+                        return "hbpl::write(" + a + ")";
+                    }
+                    if (m == "ReadLine") return "hbpl::readLine()";
+                    if (m == "Clear") return "hbpl::clear()";
+                    if (m == "ReadKey") return "hbpl::readKey()";
+                }
 
-// Los strings del .hbpl pueden traer " \ o saltos de linea,
-// y eso romperia el .asciz si no se escapa
-string escaparAsm(const string& s) {
+                // str(x) conversion
+                if (e->left && e->left->kind == Expr::Variable && e->left->value == "str" && e->args.size() == 1)
+                    return "std::to_string(" + expr(e->args[0]) + ")";
 
-    string r;
+                // list.push(a,b) becomes two push_back calls.
+                if (e->left && e->left->kind == Expr::Member && e->left->value == "push") {
+                    string z = "[&](){";
+                    for (auto& a : e->args) z += expr(e->left->left) + ".push_back(" + expr(a) + ");";
+                    z += "}()";
+                    return z;
+                }
 
-    for (unsigned char c : s) {
+                // Generic call / method call
+                return expr(e->left) + "(" + joinArgs(e->args) + ")";
+            }
 
-        if      (c == '"')  r += "\\\"";
-        else if (c == '\\') r += "\\\\";
-        else if (c == '\n') r += "\\n";
-        else if (c == '\t') r += "\\t";
+            case Expr::NewObject:
+                if (e->value == "list") return "std::vector<std::shared_ptr<void>>{}";
+                return "std::make_shared<" + e->value + ">( " + joinArgs(e->args) + " )";
 
-        else if (c < 32) {
-
-            char b[8];
-            snprintf(b, sizeof b, "\\%03o", c);
-            r += b;
+            case Expr::Array: {
+                string z = "{";
+                for (size_t i=0;i<e->args.size();++i) {
+                    if (i) z += ", ";
+                    z += expr(e->args[i]);
+                }
+                return z + "}";
+            }
         }
-
-        else r += static_cast<char>(c);
+        return "0";
     }
 
-    return r;
-}
-
-
-void generar(const Program& p, const string& archivo) {
-
-    vector<string> strings;   // textos que van a .rdata
-    ostringstream code;
-
-    bool hayFinish = false;
-
-    // Registros de los 4 primeros argumentos en Windows x64
-    const char* regs[4] = {"%rcx", "%rdx", "%r8", "%r9"};
-
-
-    for (const Function& f : p.functions) {
-
-        if (f.name == "finish") hayFinish = true;
-
-
-        // Cada variable (parametro o local) ocupa 8 bytes en la pila,
-        // por encima de los 32 bytes de shadow space
-        map<string, int> slot;
-
-        for (const Param& pr : f.params) {
-            int n = static_cast<int>(slot.size());
-            slot[pr.name] = n;
+    string joinArgs(const vector<shared_ptr<Expr>>& a) {
+        string z;
+        for (size_t i=0;i<a.size();++i) {
+            if (i) z += ", ";
+            z += expr(a[i]);
         }
+        return z;
+    }
 
-        for (const Stmt& s : f.body) {
-            if (s.kind == Stmt::VarDecl) {
-                int n = static_cast<int>(slot.size());
-                slot[s.name] = n;
-            }
-        }
-
-        // Al entrar a la funcion rsp = 8 (mod 16): el marco debe ser 8 (mod 16)
-        int frame = 32 + 8 * static_cast<int>(slot.size());
-
-        if (frame % 16 == 0) frame += 8;
-
-
-        auto offset = [&](const string& v) {
-            return 32 + 8 * slot[v];
-        };
-
-        // Carga un valor en un registro
-        auto cargar = [&](const Expr& e, const string& reg) {
-
-            if (e.kind == Expr::Str) {
-
-                code << "    leaq .LC" << strings.size()
-                     << "(%rip), " << reg << "\n";
-
-                strings.push_back(e.text);
-            }
-
-            else {   // Var o Borrow: ambos pasan el puntero
-
-                code << "    movq " << offset(e.text)
-                     << "(%rsp), " << reg << "\n";
-            }
-        };
-
-
-        string name = asmName(f.name);
-
-        code << "    .globl " << name << "\n";
-        code << name << ":\n";
-        code << "    subq $" << frame << ", %rsp\n";
-
-        // Guardar los parametros recibidos en sus casillas de la pila
-        for (size_t i = 0; i < f.params.size(); i++) {
-
-            code << "    movq " << regs[i] << ", "
-                 << offset(f.params[i].name) << "(%rsp)\n";
-        }
-
-
-        for (const Stmt& s : f.body) {
-
-            switch (s.kind) {
-
-            case Stmt::Log:
-
-                cargar(s.args[0], "%rcx");
-                code << "    call hbpl_console_log\n";
-
-                break;
-
-
-            case Stmt::Exit:
-
-                code << "    movl $" << s.code << ", %ecx\n";
-                code << "    call hbpl_exit\n";
-
-                break;
-
-
+    void stmt(shared_ptr<Stmt> s) {
+        switch (s->kind) {
             case Stmt::VarDecl:
-
-                cargar(s.args[0], "%rax");
-                code << "    movq %rax, " << offset(s.name) << "(%rsp)\n";
-
-                break;
-
-
-            case Stmt::Reserv:
-
-                code << "    movq " << offset(s.name) << "(%rsp), %rcx\n";
-                code << "    call hbpl_str_reserv\n";
-                code << "    movq %rax, " << offset(s.name) << "(%rsp)\n";
-
-                break;
-
-
-            case Stmt::Free:
-
-                code << "    movq " << offset(s.name) << "(%rsp), %rcx\n";
-                code << "    call hbpl_free\n";
-
-                break;
-
-
-            case Stmt::Call:
-
-                for (size_t i = 0; i < s.args.size(); i++) {
-                    cargar(s.args[i], regs[i]);
+                o << ind() << (s->isConst ? "const " : "")
+                  << declaredType(s->type, s->name) << " " << s->name;
+                if (s->expr) {
+                    if (s->type == "list" && s->expr->kind == Expr::NewObject && s->expr->value == "list")
+                        o << "{}";
+                    else
+                        o << " = " << expr(s->expr);
                 }
-
-                code << "    call " << asmName(s.name) << "\n";
-
+                o << ";\n";
                 break;
+
+            case Stmt::Assign:
+                o << ind() << expr(s->expr) << " = " << expr(s->args[0]) << ";\n";
+                break;
+
+            case Stmt::ExprStmt:
+                o << ind() << expr(s->expr) << ";\n";
+                break;
+
+            case Stmt::Return:
+                o << ind() << "return " << expr(s->expr) << ";\n";
+                break;
+
+            case Stmt::If:
+                o << ind() << "if (" << expr(s->expr) << ") {\n";
+                ++indent;
+                for (auto& x : s->body) stmt(x);
+                --indent;
+                o << ind() << "}";
+                if (!s->elseBody.empty()) {
+                    o << " else ";
+                    if (s->elseBody.size() == 1 && s->elseBody[0]->kind == Stmt::If) {
+                        // Simplified nested output.
+                        o << "{\n"; ++indent; stmt(s->elseBody[0]); --indent; o << ind() << "}";
+                    } else {
+                        o << "{\n"; ++indent;
+                        for (auto& x : s->elseBody) stmt(x);
+                        --indent; o << ind() << "}";
+                    }
+                }
+                o << "\n";
+                break;
+
+            case Stmt::While:
+                o << ind() << "while (" << expr(s->expr) << ") {\n";
+                ++indent; for (auto& x : s->body) stmt(x); --indent;
+                o << ind() << "}\n";
+                break;
+
+            case Stmt::For:
+                // The HBPL simplified for has no explicit increment.
+                // Infer ++ for the first declaration when possible.
+                if (!s->body.empty() && s->body[0]->kind == Stmt::VarDecl) {
+                    auto init = s->body[0];
+                    o << ind() << "for (" << (init->isConst ? "const " : "")
+                      << cppType(init->type) << " " << init->name;
+                    if (init->expr) o << " = " << expr(init->expr);
+                    o << "; " << expr(s->expr) << "; ++" << init->name << ") {\n";
+                    ++indent;
+                    for (size_t i=1;i<s->body.size();++i) stmt(s->body[i]);
+                    --indent;
+                    o << ind() << "}\n";
+                } else {
+                    o << ind() << "while (" << expr(s->expr) << ") {\n";
+                    ++indent; for (auto& x : s->body) stmt(x); --indent;
+                    o << ind() << "}\n";
+                }
+                break;
+
+            case Stmt::Foreach:
+                o << ind() << "for (auto& " << s->name << " : " << expr(s->iterable) << ") {\n";
+                ++indent; for (auto& x : s->body) stmt(x); --indent;
+                o << ind() << "}\n";
+                break;
+
+            case Stmt::TryCatch:
+                o << ind() << "try {\n";
+                ++indent; for (auto& x : s->body) stmt(x); --indent;
+                o << ind() << "} catch (const std::exception& " << (s->catchName.empty() ? "err" : s->catchName) << ") {\n";
+                ++indent; for (auto& x : s->catchBody) stmt(x); --indent;
+                o << ind() << "}\n";
+                break;
+
+            default: break;
+        }
+    }
+
+    string inferredParamType(const Function& f, const string& owner, const Param& param) const {
+        if (param.type != "auto") return param.type;
+        // Infer constructor parameters from assignments such as:
+        // me.nombre = nombre
+        // me.grado = grado
+        if (f.name == "onCreated") {
+            for (const auto& st : f.body) {
+                if (st->kind != Stmt::Assign || !st->expr || st->expr->kind != Expr::Member) continue;
+                if (!st->expr->left || st->expr->left->kind != Expr::Variable || st->expr->left->value != "me") continue;
+                if (st->args.empty() || st->args[0]->kind != Expr::Variable || st->args[0]->value != param.name) continue;
+                for (const auto& c : p.classes) if (c.name == owner)
+                    for (const auto& field : c.fields) if (field.name == st->expr->value) return field.type;
             }
         }
-
-        code << "    addq $" << frame << ", %rsp\n";
-        code << "    ret\n\n";
+        return "std::string";
     }
 
-
-    // El runtime siempre llama a hbpl_finish, asi que si el usuario
-    // no escribio 'fn finish', generamos uno vacio
-    if (!hayFinish) {
-
-        code << "    .globl hbpl_finish\n";
-        code << "hbpl_finish:\n";
-        code << "    ret\n";
+    void method(const Function& f, const string& owner) {
+        if (f.name == "onCreated") o << owner << "::" << owner << "(";
+        else o << cppType(f.returnType.empty() ? "void" : f.returnType) << " " << owner << "::" << f.name << "(";
+        bool first = true;
+        for (auto& a : f.params) {
+            if (a.name == "me") continue;
+            if (!first) o << ", ";
+            first = false;
+            o << cppType(inferredParamType(f, owner, a)) << " " << a.name;
+        }
+        o << ") {\n";
+        ++indent;
+        for (auto& s : f.body) stmt(s);
+        --indent;
+        o << "}\n\n";
     }
 
+public:
+    CppBackend(Program& x, ostream& out) : p(x), o(out) {}
 
-    ofstream out(archivo);
+    void emit() {
+        o << "#include <iostream>\n"
+             "#include <string>\n"
+             "#include <vector>\n"
+             "#include <memory>\n"
+             "#include <stdexcept>\n"
+             "#include <cstdlib>\n"
+             "#include <cmath>\n"
+             "#include <limits>\n\n";
 
-    if (!out) {
-        fallo("archivo", "no se pudo crear " + archivo);
+        o << "namespace hbpl {\n"
+             "template<class T> void log(const T& x){ std::cout << x << '\\n'; }\n"
+             "inline void log(const std::string& x){ std::cout << x << '\\n'; }\n"
+             "template<class T> void write(const T& x){ std::cout << x; std::cout.flush(); }\n"
+             "inline std::string readLine(){ std::string x; std::getline(std::cin,x); return x; }\n"
+             "inline void clear(){\n"
+             "#ifdef _WIN32\n"
+             "std::system(\"cls\");\n"
+             "#else\n"
+             "std::system(\"clear\");\n"
+             "#endif\n"
+             "}\n"
+             "inline char readKey(){ char c=0; std::cin.get(c); return c; }\n"
+             "}\n\n";
+
+        for (auto& c : p.classes) {
+            o << "struct " << c.name;
+            if (!c.base.empty()) o << " : public " << c.base;
+            o << " {\n";
+            ++indent;
+            for (auto& f : c.fields) {
+                o << ind() << cppType(f.type) << " " << f.name << ";\n";
+            }
+            for (auto& f : c.methods) {
+                if (f.name == "onCreated") {
+                    o << ind() << c.name << "(";
+                } else {
+                    o << ind() << cppType(f.returnType.empty() ? "void" : f.returnType) << " " << f.name << "(";
+                }
+                bool first=true;
+                for (auto& a : f.params) {
+                    if (a.name=="me") continue;
+                    if (!first) o << ", ";
+                    first=false;
+                    o << cppType(inferredParamType(f, c.name, a)) << " " << a.name;
+                }
+                o << ");\n";
+            }
+            --indent;
+            o << "};\n\n";
+        }
+
+        // Global functions need declarations first.
+        for (auto& f : p.functions) {
+            listElementTypes.clear();
+            localTypes.clear();
+            collectListTypes(f.body);
+            string fn = (f.name == "main") ? "hbpl_main" : f.name;
+            o << cppType((f.returnType.empty() && f.name != "main") ? "void" : (f.returnType.empty() ? "int" : f.returnType)) << " " << fn << "(";
+            for (size_t i=0;i<f.params.size();++i) {
+                if (i) o << ", ";
+                o << cppType(f.params[i].type) << " " << f.params[i].name;
+            }
+            o << ");\n";
+        }
+        o << "\n";
+
+        for (auto& c : p.classes)
+            for (auto& f : c.methods)
+                method(f, c.name);
+
+        for (auto& f : p.functions) {
+            listElementTypes.clear();
+            localTypes.clear();
+            collectListTypes(f.body);
+            string fn = (f.name == "main") ? "hbpl_main" : f.name;
+            o << cppType((f.returnType.empty() && f.name != "main") ? "void" : (f.returnType.empty() ? "int" : f.returnType)) << " " << fn << "(";
+            for (size_t i=0;i<f.params.size();++i) {
+                if (i) o << ", ";
+                o << cppType(f.params[i].type) << " " << f.params[i].name;
+            }
+            o << ") {\n";
+            ++indent;
+            for (auto& s : f.body) stmt(s);
+            if (f.name == "main") o << ind() << "return 0;\n";
+            --indent;
+            o << "}\n\n";
+        }
+
+        o << "int main() { int rc = hbpl_main(); finish(); return rc; }\n";
     }
+};
 
-    out << "    .section .rdata\n";
+// ------------------------------------------------------------
+// Driver
+// ------------------------------------------------------------
 
-    for (size_t i = 0; i < strings.size(); i++) {
-
-        out << ".LC" << i << ":\n"
-            << "    .asciz \"" << escaparAsm(strings[i]) << "\"\n";
-    }
-
-    out << "\n    .text\n";
-    out << code.str();
+static string readFile(const string& path) {
+    ifstream f(path, ios::binary);
+    if (!f) throw runtime_error("no se pudo abrir: " + path);
+    stringstream ss; ss << f.rdbuf();
+    return ss.str();
 }
 
+static void usage() {
+    cout << "HBPL Compiler v0.2\n"
+         << "Uso:\n"
+         << "  compiler archivo.hbpl -o programa.exe\n"
+         << "  compiler archivo.hbpl --emit-cpp archivo.cpp\n";
+}
 
-// ============================================================
-// MAIN
-// ============================================================
+int main(int argc, char** argv) {
+    try {
+        if (argc < 2) { usage(); return 1; }
 
-int main(int argc, char* argv[]) {
+        string input = argv[1];
+        string output = "a.exe";
+        string emitCpp;
 
-    if (argc < 2) {
+        for (int i=2;i<argc;++i) {
+            string a = argv[i];
+            if (a == "-o" && i+1 < argc) output = argv[++i];
+            else if (a == "--emit-cpp" && i+1 < argc) emitCpp = argv[++i];
+            else if (a == "--help") { usage(); return 0; }
+            else throw runtime_error("opción desconocida: " + a);
+        }
 
-        cout << "Uso: compiler archivo.hbpl\n";
+        string source = readFile(input);
+        Lexer lexer(source);
+        auto tokens = lexer.run();
 
+        Parser parser(tokens);
+        Program program = parser.parse();
+
+        Analyzer analyzer(program);
+        analyzer.run();
+
+        string cppPath = emitCpp.empty()
+            ? (filesystem::temp_directory_path() / "hbpl_generated.cpp").string()
+            : emitCpp;
+
+        ofstream cpp(cppPath);
+        if (!cpp) throw runtime_error("no se pudo crear: " + cppPath);
+
+        CppBackend backend(program, cpp);
+        backend.emit();
+        cpp.close();
+
+        if (!emitCpp.empty()) {
+            cout << "HBPL: C++ generado en " << cppPath << "\n";
+            return 0;
+        }
+
+        string cmd = "g++ -std=c++17 \"" + cppPath + "\" -o \"" + output + "\"";
+        cout << "HBPL: compilando...\n";
+        int rc = std::system(cmd.c_str());
+
+        if (!emitCpp.empty()) return rc;
+        filesystem::remove(cppPath);
+
+        if (rc != 0) {
+            cerr << "HBPL Error: fallo el backend C++/linker.\n";
+            return rc;
+        }
+
+        cout << "HBPL: generado " << output << "\n";
+        return 0;
+    } catch (const exception& e) {
+        cerr << e.what() << "\n";
         return 1;
     }
-
-
-    // texto -> tokens
-    lexer lex(argv[1]);
-    vector<token> tokens = lex.parse();
-
-
-    // tokens -> Program
-    parser p(tokens);
-    Program prog = p.parseProgram();
-
-
-    // comprobar reglas (@manual, variables, funciones)
-    analizar(prog);
-
-
-    // Program -> asm
-    filesystem::create_directories(".bin");
-
-    generar(prog, ".bin/out.s");
-
-
-    // asm + runtime -> exe
-    if (system("g++ -c runtime.cpp -o .bin/runtime.o") != 0) {
-
-        cerr << "Err: fallo al compilar runtime.cpp\n";
-
-        return 1;
-    }
-
-    if (system("g++ .bin/out.s .bin/runtime.o -o .bin/out.exe") != 0) {
-
-        cerr << "Err: fallo al ensamblar out.s\n";
-
-        return 1;
-    }
-    if (system("rm .bin/out.s") != 0){
-        cerr << "Err: fallo al eliminar archivo temporal";
-        return 1;
-    }
-
-
-
-    return 0;
 }

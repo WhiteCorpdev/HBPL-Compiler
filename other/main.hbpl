@@ -1,0 +1,32 @@
+class estudiante>
+    [private]
+    int grado
+
+    [private]
+    str nombre
+
+    fn onCreated(me, str nombre, int grado)>
+        me.nombre = nombre
+        me.grado = grado
+    end
+
+    fn say(me)>
+        Console.Log(me.nombre + " " + str(me.grado))
+    end
+end
+
+fn main()>
+    estudiante juan = new estudiante("juan", 6)
+    estudiante karla = new estudiante("Karla", 4)
+    estudiante josh = new estudiante("josh", 9)
+
+    list estudiantes = new list()
+    estudiantes.push(juan, karla, josh)
+    foreach estudiante in estudiantes>
+        estudiante.say()
+    end
+end
+
+fn finish()>
+    Console.Log("Finishing")
+end

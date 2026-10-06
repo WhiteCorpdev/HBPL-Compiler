@@ -1,0 +1,12 @@
+import Network using http , http.types
+import path
+
+const server app = http.init()
+const int port = 5000
+
+@app.get
+fn main(request req,response res)>
+    res.sendfile(path.join(path.currentDir,"/html/index.html")
+    end
+
+app.listen(port)
