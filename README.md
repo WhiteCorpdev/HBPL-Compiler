@@ -380,7 +380,32 @@ end
 El incremento del ciclo es administrado automáticamente por el lenguaje según la forma de `for` utilizada.
 
 ---
+# 15.1 break
 
+HBPL para parar un bucle se usa `break`
+
+```hbpl
+for ...
+  if i == 1>
+    break
+  end
+  //codigo
+end
+```
+___
+# 15.2 continue
+
+HBPL para parar un bucle se usa `continue`
+
+```hbpl
+for ...
+  if i == 1>
+    continue
+  end
+  //codigo
+end
+```
+___
 # 16. Foreach
 
 `foreach` permite recorrer elementos de una colección.

@@ -74,6 +74,7 @@ enum class TK {
     KwIf, KwElse, KwWhile, KwFor, KwForeach, KwIn,
     KwClass, KwType, KwEnum, KwConst, KwNew,
     KwOverride, KwTry, KwCatch, KwImport, KwCodeSpace,
+    KwBreak, KwContinue,
     KwTrue, KwFalse, KwNull,
     KwPrivate, KwPublic, KwProtected,
     KwOnCreated,
@@ -165,6 +166,7 @@ public:
                     {"enum",TK::KwEnum},{"const",TK::KwConst},{"new",TK::KwNew},
                     {"override",TK::KwOverride},{"try",TK::KwTry},{"catch",TK::KwCatch},
                     {"import",TK::KwImport},{"codeSpace",TK::KwCodeSpace},
+                    {"break",TK::KwBreak},{"continue",TK::KwContinue},
                     {"true",TK::KwTrue},{"false",TK::KwFalse},{"null",TK::KwNull},
                     {"private",TK::KwPrivate},{"public",TK::KwPublic},
                     {"protected",TK::KwProtected},{"onCreated",TK::KwOnCreated},
@@ -262,7 +264,8 @@ struct Expr {
 struct Stmt {
     enum Kind {
         Block, VarDecl, Assign, ExprStmt, Return,
-        If, While, For, Foreach, TryCatch, Console
+        If, While, For, Foreach, TryCatch, Console,
+        Break, Continue
     } kind;
     SourcePos pos;
     string type, name, op, catchName;
@@ -633,6 +636,15 @@ shared_ptr<Stmt> Parser::statement() {
             s->expr = expression();
             return s;
         }
+        if (eat(TK::KwBreak)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::Break; s->pos = x.pos;
+            return s;
+        }
+
+        if (eat(TK::KwContinue)) {
+            auto s = make_shared<Stmt>(); s->kind = Stmt::Continue; s->pos = x.pos;
+            return s;
+        }
 
         if (eat(TK::KwIf)) {
             auto s = make_shared<Stmt>(); s->kind = Stmt::If; s->pos = x.pos;
@@ -640,20 +652,19 @@ shared_ptr<Stmt> Parser::statement() {
             expect(TK::GreaterBlock, "se esperaba '>'");
             s->body = block();
             if (eat(TK::KwElse)) {
-                if (eat(TK::KwIf)) {
-                    // Represent else-if as a nested if.
-                    auto nested = statement();
-                    s->elseBody.push_back(nested);
-                } else {
-                    expect(TK::GreaterBlock, "se esperaba '>' después de else");
-                    s->elseBody = block();
-                    expect(TK::KwEnd, "se esperaba end");
+                if (is(TK::KwIf)) {
+                    // No consumir el 'if': statement() lo hace.
+                    // El if anidado consume el 'end' compartido.
+                    s->elseBody.push_back(statement());
                     return s;
                 }
+                expect(TK::GreaterBlock, "se esperaba '>' después de else");
+                s->elseBody = block();
+                expect(TK::KwEnd, "se esperaba end");
+                return s;
             }
             expect(TK::KwEnd, "se esperaba end");
-            return s;
-        }
+            return s;}
 
         if (eat(TK::KwWhile)) {
             auto s = make_shared<Stmt>(); s->kind = Stmt::While; s->pos = x.pos;
@@ -739,6 +750,7 @@ class Analyzer {
     Program& p;
     unordered_map<string, Function*> funcs;
     unordered_map<string, ClassDef*> classes;
+    int loopDepth = 0;
 
     static bool numeric(const string& t) {
         static const unordered_set<string> n = {
@@ -826,16 +838,31 @@ class Analyzer {
             case Stmt::Return:
                 exprType(s->expr, env); break;
             case Stmt::If:
-            case Stmt::While:
                 exprType(s->expr, env);
                 for (auto& x : s->body) stmt(x, env);
                 for (auto& x : s->elseBody) stmt(x, env);
                 break;
-            case Stmt::For:
+            case Stmt::While:
+                exprType(s->expr, env);
+                ++loopDepth;
                 for (auto& x : s->body) stmt(x, env);
+                --loopDepth;
+                break;
+            case Stmt::For:
+                ++loopDepth;
+                for (auto& x : s->body) stmt(x, env);
+                --loopDepth;
                 break;
             case Stmt::Foreach:
+                ++loopDepth;
                 for (auto& x : s->body) stmt(x, env);
+                --loopDepth;
+                break;
+            case Stmt::Break:
+                if (loopDepth == 0) fail(s->pos, "break fuera de un bucle");
+                break;
+            case Stmt::Continue:
+                if (loopDepth == 0) fail(s->pos, "continue fuera de un bucle");
                 break;
             case Stmt::TryCatch:
                 for (auto& x : s->body) stmt(x, env);
@@ -1168,6 +1195,14 @@ class CppBackend {
                 o << ind() << "}\n";
                 break;
 
+            case Stmt::Break:
+                o << ind() << "break;\n";
+                break;
+
+            case Stmt::Continue:
+                o << ind() << "continue;\n";
+                break;
+
             default: break;
         }
     }
@@ -1314,23 +1349,28 @@ static string readFile(const string& path) {
 }
 
 static void usage() {
-    cout << "HBPL Compiler v0.2\n"
+    cout << "HBPL Compiler v0.7\n"
          << "Uso:\n"
          << "  compiler archivo.hbpl -o programa.exe\n"
          << "  compiler archivo.hbpl --emit-cpp archivo.cpp\n";
 }
+static void ver()
+{
+    cout << "v0.7";
 
+}
 int main(int argc, char** argv) {
     try {
         if (argc < 2) { usage(); return 1; }
 
         string input = argv[1];
-        string output = "a.exe";
+        string output = "./.bin/main.exe";
         string emitCpp;
 
         for (int i=2;i<argc;++i) {
             string a = argv[i];
             if (a == "-o" && i+1 < argc) output = argv[++i];
+            else if (a == "--ver") {ver();return 0;}
             else if (a == "--emit-cpp" && i+1 < argc) emitCpp = argv[++i];
             else if (a == "--help") { usage(); return 0; }
             else throw runtime_error("opción desconocida: " + a);

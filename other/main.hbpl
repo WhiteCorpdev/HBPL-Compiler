@@ -1,32 +1,106 @@
-class estudiante>
-    [private]
-    int grado
+// Demo de HBPL: usa todo lo que el compilador soporta hoy
 
+class Estudiante>
     [private]
     str nombre
 
-    fn onCreated(me, str nombre, int grado)>
+    [private]
+    int nota
+
+    [public]
+    fn onCreated(me, str nombre, int nota)>
         me.nombre = nombre
-        me.grado = grado
+        me.nota = nota
+    end
+
+    fn getNota(me) -> int>
+        return me.nota
     end
 
     fn say(me)>
-        Console.Log(me.nombre + " " + str(me.grado))
+        Console.Log(me.nombre + " tiene nota " + str(me.nota))
     end
 end
 
+fn sumar(int a, int b) -> int>
+    return a + b
+end
+
+fn promedio(int total, int cantidad) -> double>
+    return double(total) / cantidad
+end
+
 fn main()>
-    estudiante juan = new estudiante("juan", 6)
-    estudiante karla = new estudiante("Karla", 4)
-    estudiante josh = new estudiante("josh", 9)
+    Console.Clear()
+    Console.Write("Tu nombre: ")
+    str usuario = Console.ReadLine()
+    Console.Log("Hola " + usuario)
+
+    // variables y constantes
+    const int MAX = 3
+    double bono = 0.5
+    bool aprobado = true
+
+    // objetos y lista
+    Estudiante ana = new Estudiante("Ana", 8)
+    Estudiante luis = new Estudiante("Luis", 5)
+    Estudiante eva = new Estudiante("Eva", 9)
 
     list estudiantes = new list()
-    estudiantes.push(juan, karla, josh)
-    foreach estudiante in estudiantes>
-        estudiante.say()
+    estudiantes.push(ana, luis, eva)
+
+    // foreach
+    int suma = 0
+    foreach e in estudiantes>
+        e.say()
+        suma = suma + e.getNota()
+    end
+
+    // while con continue y break (imprime: 1 3 4)
+    int n = 0
+    while n < 10>
+        n = n + 1
+        if n == 2>
+            continue
+        end
+        if n == 5>
+            break
+        end
+        Console.Write(str(n) + " ")
+    end
+    Console.Write("\n")
+
+    // for anidado
+    for int fila = 0; fila < MAX>
+        for int col = 0; col < MAX>
+            Console.Write("#")
+        end
+        Console.Write("\n")
+    end
+
+    // funciones con return
+    int total = sumar(suma, 10)
+    Console.Log("Total mas diez: " + str(total))
+
+    double prom = promedio(suma, MAX)
+    Console.Log("Promedio: " + str(prom + bono))
+
+    // if / else con operador logico
+    if prom >= 7 && aprobado>
+        Console.Log("Grupo aprobado")
+    else>
+        Console.Log("Grupo reprobado")
+    end
+
+    // try / catch
+    try>
+        Console.Log("Dentro de try")
+    catch>
+        Console.Log("Error capturado")
     end
 end
 
 fn finish()>
-    Console.Log("Finishing")
+    Console.Log("Presiona Enter para salir")
+    Console.ReadKey()
 end
