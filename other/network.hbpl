@@ -1,15 +1,15 @@
-import Network using http , http.types
+import Network using http, http.types, tcp, tcp.types
 import path
 
 const server app = http.init()
 const int port = 5000
+
 app.listen(port)
 
-
 @app.get("/")
-fn home(request req,response res)>
-    res.sendfile(path.join(path.currentDir,"/html/index.html")
-    end
+fn home(request req, response res)>
+    res.sendfile(path.join(path.currentDir, "html/index.html"))
+end
 
 fn main()>
     app.start()

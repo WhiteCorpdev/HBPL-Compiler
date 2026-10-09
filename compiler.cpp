@@ -1,4 +1,4 @@
-// HBPL Compiler v0.2 - bootstrap compiler
+// HBPL Compiler v0.8 Core - bootstrap compiler
 // Compiles HBPL -> C++17 -> native executable.
 // This is the first working backend; the frontend is designed to be replaced
 // by a native ASM backend later without changing the language frontend.
@@ -74,7 +74,6 @@ enum class TK {
     KwIf, KwElse, KwWhile, KwFor, KwForeach, KwIn,
     KwClass, KwType, KwEnum, KwConst, KwNew,
     KwOverride, KwTry, KwCatch, KwImport, KwCodeSpace,
-    KwBreak, KwContinue,
     KwTrue, KwFalse, KwNull,
     KwPrivate, KwPublic, KwProtected,
     KwOnCreated,
@@ -84,7 +83,7 @@ enum class TK {
     TypeFloat, TypeDouble, TypeBool,
 
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
-    Comma, Dot, Colon, Semicolon, Arrow, GreaterBlock,
+    Comma, Dot, Colon, Semicolon, At, Arrow, GreaterBlock,
     Plus, Minus, Star, Slash, Percent,
     Equal, EqualEqual, Bang, BangEqual,
     Less, LessEqual, Greater, GreaterEqual,
@@ -166,7 +165,6 @@ public:
                     {"enum",TK::KwEnum},{"const",TK::KwConst},{"new",TK::KwNew},
                     {"override",TK::KwOverride},{"try",TK::KwTry},{"catch",TK::KwCatch},
                     {"import",TK::KwImport},{"codeSpace",TK::KwCodeSpace},
-                    {"break",TK::KwBreak},{"continue",TK::KwContinue},
                     {"true",TK::KwTrue},{"false",TK::KwFalse},{"null",TK::KwNull},
                     {"private",TK::KwPrivate},{"public",TK::KwPublic},
                     {"protected",TK::KwProtected},{"onCreated",TK::KwOnCreated},
@@ -232,6 +230,7 @@ public:
                 case ',': out.push_back({TK::Comma,",",at}); break;
                 case '.': out.push_back({TK::Dot,".",at}); break;
                 case ':': out.push_back({TK::Colon,":",at}); break;
+                case '@': out.push_back({TK::At,"@",at}); break;
                 case ';': out.push_back({TK::Semicolon,";",at}); break;
                 case '>': out.push_back({TK::GreaterBlock,">",at}); break;
                 case '+': out.push_back({TK::Plus,"+",at}); break;
@@ -257,6 +256,7 @@ struct Expr {
     enum Kind { Literal, Variable, Binary, Unary, Call, Member, NewObject, Array } kind;
     SourcePos pos;
     string value;
+    bool isStringLiteral = false;
     vector<shared_ptr<Expr>> args;
     shared_ptr<Expr> left, right;
 };
@@ -264,8 +264,7 @@ struct Expr {
 struct Stmt {
     enum Kind {
         Block, VarDecl, Assign, ExprStmt, Return,
-        If, While, For, Foreach, TryCatch, Console,
-        Break, Continue
+        If, While, For, Foreach, TryCatch, Console
     } kind;
     SourcePos pos;
     string type, name, op, catchName;
@@ -285,6 +284,9 @@ struct Function {
     bool isMethod = false;
     string owner;
     bool isOverride = false;
+    string routeMethod;
+    string routePath;
+    string routeServer;
 };
 
 struct Field {
@@ -301,6 +303,7 @@ struct ClassDef {
 
 struct Program {
     vector<string> imports;
+    vector<shared_ptr<Stmt>> globals;
     vector<Function> functions;
     vector<ClassDef> classes;
     string codeSpace;
@@ -313,6 +316,9 @@ struct Program {
 class Parser {
     vector<Token> t;
     size_t i = 0;
+    string pendingRouteMethod;
+    string pendingRoutePath;
+    string pendingRouteServer;
 
     const Token& cur() const { return t[i]; }
     bool is(TK k) const { return cur().kind == k; }
@@ -373,7 +379,9 @@ class Parser {
 
         if (is(TK::String) || is(TK::Number)) {
             take();
-            return make(Expr::Literal, x.pos, x.text);
+            auto e = make(Expr::Literal, x.pos, x.text);
+            e->isStringLiteral = (x.kind == TK::String);
+            return e;
         }
 
         if (is(TK::KwTrue) || is(TK::KwFalse) || is(TK::KwNull)) {
@@ -490,6 +498,12 @@ class Parser {
         f.owner = owner;
         f.isMethod = !owner.empty();
         f.isOverride = overrideFlag;
+        f.routeMethod = pendingRouteMethod;
+        f.routePath = pendingRoutePath;
+        f.routeServer = pendingRouteServer;
+        pendingRouteMethod.clear();
+        pendingRoutePath.clear();
+        pendingRouteServer.clear();
         if (!overrideFlag) expect(TK::KwFn, "se esperaba fn");
         Token name = take();
         if (name.kind != TK::Ident && name.kind != TK::KwMain && name.kind != TK::KwFinish &&
@@ -588,6 +602,19 @@ public:
                 while (eat(TK::Dot)) {
                     name += "." + expect(TK::Ident, "se esperaba parte del import").text;
                 }
+                if (is(TK::Ident) && cur().text == "using") {
+                    take();
+                    name += " using ";
+                    do {
+                        Token u = expect(TK::Ident, "se esperaba módulo después de using");
+                        name += u.text;
+                        while (eat(TK::Dot)) {
+                            name += "." + expect(TK::Ident, "se esperaba parte del módulo").text;
+                        }
+                        if (!eat(TK::Comma)) break;
+                        name += ", ";
+                    } while (true);
+                }
                 p.imports.push_back(name);
                 continue;
             }
@@ -601,6 +628,32 @@ public:
 
             if (is(TK::KwClass)) {
                 p.classes.push_back(parseClass());
+                continue;
+            }
+
+            if (is(TK::KwConst) || isTypeName(cur().kind) ||
+                (is(TK::Ident) && i + 1 < t.size() && t[i + 1].kind == TK::Ident)) {
+                p.globals.push_back(variableDecl());
+                continue;
+            }
+
+            if (is(TK::Ident)) {
+                p.globals.push_back(statement());
+                continue;
+            }
+
+            if (eat(TK::At)) {
+                Token server = expect(TK::Ident, "se esperaba servidor después de @");
+                expect(TK::Dot, "se esperaba '.' en decorador");
+                Token method = expect(TK::Ident, "se esperaba método HTTP");
+                expect(TK::LParen, "se esperaba '('");
+                Token route = expect(TK::String, "se esperaba ruta HTTP");
+                expect(TK::RParen, "se esperaba ')'");
+                pendingRouteServer = server.text;
+                pendingRouteMethod = method.text;
+                pendingRoutePath = route.text;
+                if (!is(TK::KwFn)) fail(cur().pos, "se esperaba fn después del decorador");
+                p.functions.push_back(parseFunction());
                 continue;
             }
 
@@ -636,15 +689,6 @@ shared_ptr<Stmt> Parser::statement() {
             s->expr = expression();
             return s;
         }
-        if (eat(TK::KwBreak)) {
-            auto s = make_shared<Stmt>(); s->kind = Stmt::Break; s->pos = x.pos;
-            return s;
-        }
-
-        if (eat(TK::KwContinue)) {
-            auto s = make_shared<Stmt>(); s->kind = Stmt::Continue; s->pos = x.pos;
-            return s;
-        }
 
         if (eat(TK::KwIf)) {
             auto s = make_shared<Stmt>(); s->kind = Stmt::If; s->pos = x.pos;
@@ -652,19 +696,20 @@ shared_ptr<Stmt> Parser::statement() {
             expect(TK::GreaterBlock, "se esperaba '>'");
             s->body = block();
             if (eat(TK::KwElse)) {
-                if (is(TK::KwIf)) {
-                    // No consumir el 'if': statement() lo hace.
-                    // El if anidado consume el 'end' compartido.
-                    s->elseBody.push_back(statement());
+                if (eat(TK::KwIf)) {
+                    // Represent else-if as a nested if.
+                    auto nested = statement();
+                    s->elseBody.push_back(nested);
+                } else {
+                    expect(TK::GreaterBlock, "se esperaba '>' después de else");
+                    s->elseBody = block();
+                    expect(TK::KwEnd, "se esperaba end");
                     return s;
                 }
-                expect(TK::GreaterBlock, "se esperaba '>' después de else");
-                s->elseBody = block();
-                expect(TK::KwEnd, "se esperaba end");
-                return s;
             }
             expect(TK::KwEnd, "se esperaba end");
-            return s;}
+            return s;
+        }
 
         if (eat(TK::KwWhile)) {
             auto s = make_shared<Stmt>(); s->kind = Stmt::While; s->pos = x.pos;
@@ -750,7 +795,6 @@ class Analyzer {
     Program& p;
     unordered_map<string, Function*> funcs;
     unordered_map<string, ClassDef*> classes;
-    int loopDepth = 0;
 
     static bool numeric(const string& t) {
         static const unordered_set<string> n = {
@@ -838,31 +882,16 @@ class Analyzer {
             case Stmt::Return:
                 exprType(s->expr, env); break;
             case Stmt::If:
+            case Stmt::While:
                 exprType(s->expr, env);
                 for (auto& x : s->body) stmt(x, env);
                 for (auto& x : s->elseBody) stmt(x, env);
                 break;
-            case Stmt::While:
-                exprType(s->expr, env);
-                ++loopDepth;
-                for (auto& x : s->body) stmt(x, env);
-                --loopDepth;
-                break;
             case Stmt::For:
-                ++loopDepth;
                 for (auto& x : s->body) stmt(x, env);
-                --loopDepth;
                 break;
             case Stmt::Foreach:
-                ++loopDepth;
                 for (auto& x : s->body) stmt(x, env);
-                --loopDepth;
-                break;
-            case Stmt::Break:
-                if (loopDepth == 0) fail(s->pos, "break fuera de un bucle");
-                break;
-            case Stmt::Continue:
-                if (loopDepth == 0) fail(s->pos, "continue fuera de un bucle");
                 break;
             case Stmt::TryCatch:
                 for (auto& x : s->body) stmt(x, env);
@@ -883,6 +912,9 @@ public:
         }
 
         if (!funcs.count("main")) fail({1,1}, "falta fn main()");
+
+        unordered_map<string,Symbol> globals;
+        for (auto& s : p.globals) stmt(s, globals);
 
         for (auto& f : p.functions) {
             unordered_map<string,Symbol> env;
@@ -930,6 +962,9 @@ class CppBackend {
         if (t == "float") return "float";
         if (t == "double") return "double";
         if (t == "bool") return "bool";
+        if (t == "server") return "void*";
+        if (t == "request") return "void*";
+        if (t == "response") return "void*";
         if (t == "null") return "std::nullptr_t";
         if (t.size() > 2 && t.substr(t.size()-2) == "[]")
             return "std::vector<" + cppType(t.substr(0,t.size()-2)) + ">";
@@ -1003,6 +1038,18 @@ class CppBackend {
                 if (e->value == "true") return "true";
                 if (e->value == "false") return "false";
                 if (e->value == "null") return "nullptr";
+                if (e->isStringLiteral) {
+                    string z = "\"";
+                    for (char c : e->value) {
+                        if (c == '\\') z += "\\\\";
+                        else if (c == '\"') z += "\\\"";
+                        else if (c == '\n') z += "\\n";
+                        else if (c == '\r') z += "\\r";
+                        else if (c == '\t') z += "\\t";
+                        else z += c;
+                    }
+                    return z + "\"";
+                }
                 if (e->value.find('\n') != string::npos) {
                     string q = e->value;
                     string z = "\"";
@@ -1034,6 +1081,12 @@ class CppBackend {
 
             case Expr::Member: {
                 string base = expr(e->left);
+                if (e->left && e->left->kind == Expr::Variable && e->left->value == "path" && e->value == "currentDir")
+                    return "hbpl_path_current_dir()";
+                if (e->left && e->left->kind == Expr::Variable && e->left->value == "Math" && e->value == "PI")
+                    return "hbpl_math_pi()";
+                if (e->left && e->left->kind == Expr::Variable && e->left->value == "Math" && e->value == "E")
+                    return "hbpl_math_e()";
                 if (e->value == "[]") return base + "[" + expr(e->args[0]) + "]";
                 if (e->value == "len") return "static_cast<int>(" + base + ".size())";
                 if (e->value == "push") return base + ".push_back";
@@ -1050,6 +1103,46 @@ class CppBackend {
             }
 
             case Expr::Call: {
+                // Math
+                if (e->left && e->left->kind == Expr::Member &&
+                    e->left->left && e->left->left->kind == Expr::Variable &&
+                    e->left->left->value == "Math") {
+                    static const unordered_map<string,string> mm = {
+                        {"Abs","hbpl_math_abs"},{"Sqrt","hbpl_math_sqrt"},{"Pow","hbpl_math_pow"},
+                        {"Sin","hbpl_math_sin"},{"Cos","hbpl_math_cos"},{"Tan","hbpl_math_tan"},
+                        {"Asin","hbpl_math_asin"},{"Acos","hbpl_math_acos"},{"Atan","hbpl_math_atan"},
+                        {"Floor","hbpl_math_floor"},{"Ceil","hbpl_math_ceil"},{"Round","hbpl_math_round"},
+                        {"Min","hbpl_math_min"},{"Max","hbpl_math_max"},{"Clamp","hbpl_math_clamp"},
+                        {"Log","hbpl_math_log"},{"Log10","hbpl_math_log10"},{"Exp","hbpl_math_exp"}
+                    };
+                    auto it = mm.find(e->left->value);
+                    if (it != mm.end()) return it->second + "(" + joinArgs(e->args) + ")";
+                    if (e->left->value == "Random") {
+                        if (e->args.empty()) return "hbpl_math_random()";
+                        return "hbpl_math_random_range(" + joinArgs(e->args) + ")";
+                    }
+                }
+
+                // path
+                if (e->left && e->left->kind == Expr::Member &&
+                    e->left->left && e->left->left->kind == Expr::Variable &&
+                    e->left->left->value == "path") {
+                    static const unordered_map<string,string> pm = {
+                        {"join","hbpl_path_join"},{"exists","hbpl_path_exists"},
+                        {"isFile","hbpl_path_is_file"},{"isDir","hbpl_path_is_dir"},
+                        {"fileName","hbpl_path_filename"},{"extension","hbpl_path_extension"},
+                        {"parent","hbpl_path_parent"}
+                    };
+                    auto it = pm.find(e->left->value);
+                    if (it != pm.end()) return it->second + "(" + joinArgs(e->args) + ")";
+                }
+
+                // HTTP initialization
+                if (e->left && e->left->kind == Expr::Member &&
+                    e->left->left && e->left->left->kind == Expr::Variable &&
+                    e->left->left->value == "http" && e->left->value == "init")
+                    return "hbpl_http_create()";
+
                 // Console
                 if (e->left && e->left->kind == Expr::Member &&
                     e->left->left && e->left->left->kind == Expr::Variable &&
@@ -1078,6 +1171,19 @@ class CppBackend {
                     for (auto& a : e->args) z += expr(e->left->left) + ".push_back(" + expr(a) + ");";
                     z += "}()";
                     return z;
+                }
+
+                // HBPL HTTP server/response methods
+                if (e->left && e->left->kind == Expr::Member && e->left->left &&
+                    e->left->left->kind == Expr::Variable) {
+                    string n = e->left->left->value;
+                    string m = e->left->value;
+                    if (m == "listen") return "hbpl_http_listen(" + n + ", " + joinArgs(e->args) + ")";
+                    if (m == "start") return "hbpl_http_start(" + n + ")";
+                    if (m == "stop") return "hbpl_http_stop(" + n + ")";
+                    if (m == "send") return "hbpl_http_response_send(" + n + (e->args.empty() ? "" : ", " + joinArgs(e->args)) + ")";
+                    if (m == "status") return "hbpl_http_response_status(" + n + ", " + joinArgs(e->args) + ")";
+                    if (m == "sendfile") return "hbpl_http_response_sendfile(" + n + ", " + joinArgs(e->args) + ")";
                 }
 
                 // Generic call / method call
@@ -1112,7 +1218,7 @@ class CppBackend {
     void stmt(shared_ptr<Stmt> s) {
         switch (s->kind) {
             case Stmt::VarDecl:
-                o << ind() << (s->isConst ? "const " : "")
+                o << ind() << ((s->isConst && s->type != "server") ? "const " : "")
                   << declaredType(s->type, s->name) << " " << s->name;
                 if (s->expr) {
                     if (s->type == "list" && s->expr->kind == Expr::NewObject && s->expr->value == "list")
@@ -1128,6 +1234,19 @@ class CppBackend {
                 break;
 
             case Stmt::ExprStmt:
+                if (s->expr && s->expr->kind == Expr::Call && s->expr->left &&
+                    s->expr->left->kind == Expr::Member && s->expr->left->value == "start" &&
+                    s->expr->left->left && s->expr->left->left->kind == Expr::Variable) {
+                    string serverName = s->expr->left->left->value;
+                    for (const auto& rf : p.functions) {
+                        if (!rf.routeMethod.empty() && rf.routeServer == serverName) {
+                            string api = rf.routeMethod == "get" ? "hbpl_http_get" :
+                                         rf.routeMethod == "post" ? "hbpl_http_post" : "";
+                            if (!api.empty())
+                                o << ind() << api << "(" << serverName << ", \"" << rf.routePath << "\", " << rf.name << ");\n";
+                        }
+                    }
+                }
                 o << ind() << expr(s->expr) << ";\n";
                 break;
 
@@ -1195,14 +1314,6 @@ class CppBackend {
                 o << ind() << "}\n";
                 break;
 
-            case Stmt::Break:
-                o << ind() << "break;\n";
-                break;
-
-            case Stmt::Continue:
-                o << ind() << "continue;\n";
-                break;
-
             default: break;
         }
     }
@@ -1252,7 +1363,21 @@ public:
              "#include <stdexcept>\n"
              "#include <cstdlib>\n"
              "#include <cmath>\n"
-             "#include <limits>\n\n";
+             "#include <limits>\n"
+             "#include <cstddef>\n\n"
+             "extern \"C\" {\n"
+             "double hbpl_math_abs(double); double hbpl_math_sqrt(double); double hbpl_math_pow(double,double);\n"
+             "double hbpl_math_sin(double); double hbpl_math_cos(double); double hbpl_math_tan(double);\n"
+             "double hbpl_math_asin(double); double hbpl_math_acos(double); double hbpl_math_atan(double);\n"
+             "double hbpl_math_floor(double); double hbpl_math_ceil(double); double hbpl_math_round(double);\n"
+             "double hbpl_math_min(double,double); double hbpl_math_max(double,double); double hbpl_math_clamp(double,double,double);\n"
+             "double hbpl_math_log(double); double hbpl_math_log10(double); double hbpl_math_exp(double);\n"
+             "double hbpl_math_pi(); double hbpl_math_e(); double hbpl_math_random(); double hbpl_math_random_range(double,double);\n"
+             "char* hbpl_path_current_dir(); char* hbpl_path_join(const char*,const char*); bool hbpl_path_exists(const char*); bool hbpl_path_is_file(const char*); bool hbpl_path_is_dir(const char*); char* hbpl_path_filename(const char*); char* hbpl_path_extension(const char*); char* hbpl_path_parent(const char*);\n"
+             "void* hbpl_http_create(); bool hbpl_http_listen(void*,int); void hbpl_http_start(void*); void hbpl_http_stop(void*);\n"
+             "void hbpl_http_get(void*,const char*,void(*)(void*,void*)); void hbpl_http_post(void*,const char*,void(*)(void*,void*));\n"
+             "void hbpl_http_response_status(void*,int); void hbpl_http_response_send(void*,const char*); void hbpl_http_response_sendfile(void*,const char*);\n"
+             "}\n\n";
 
         o << "namespace hbpl {\n"
              "template<class T> void log(const T& x){ std::cout << x << '\\n'; }\n"
@@ -1268,6 +1393,12 @@ public:
              "}\n"
              "inline char readKey(){ char c=0; std::cin.get(c); return c; }\n"
              "}\n\n";
+
+        listElementTypes.clear();
+        localTypes.clear();
+        collectListTypes(p.globals);
+        for (auto& g : p.globals) stmt(g);
+        if (!p.globals.empty()) o << "\n";
 
         for (auto& c : p.classes) {
             o << "struct " << c.name;
@@ -1333,7 +1464,11 @@ public:
             o << "}\n\n";
         }
 
-        o << "int main() { int rc = hbpl_main(); finish(); return rc; }\n";
+        bool hasFinish = false;
+        for (const auto& f : p.functions) if (f.name == "finish") hasFinish = true;
+        o << "int main() { int rc = hbpl_main();";
+        if (hasFinish) o << " finish();";
+        o << " return rc; }\n";
     }
 };
 
@@ -1349,28 +1484,23 @@ static string readFile(const string& path) {
 }
 
 static void usage() {
-    cout << "HBPL Compiler v0.7\n"
+    cout << "HBPL Compiler v0.8 Core\n"
          << "Uso:\n"
          << "  compiler archivo.hbpl -o programa.exe\n"
          << "  compiler archivo.hbpl --emit-cpp archivo.cpp\n";
 }
-static void ver()
-{
-    cout << "v0.7";
 
-}
 int main(int argc, char** argv) {
     try {
         if (argc < 2) { usage(); return 1; }
 
         string input = argv[1];
-        string output = "./.bin/main.exe";
+        string output = (filesystem::path(".bin") / (filesystem::path(input).stem().string() + ".exe")).string();
         string emitCpp;
 
         for (int i=2;i<argc;++i) {
             string a = argv[i];
             if (a == "-o" && i+1 < argc) output = argv[++i];
-            else if (a == "--ver") {ver();return 0;}
             else if (a == "--emit-cpp" && i+1 < argc) emitCpp = argv[++i];
             else if (a == "--help") { usage(); return 0; }
             else throw runtime_error("opción desconocida: " + a);
@@ -1402,7 +1532,22 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        string cmd = "g++ -std=c++17 \"" + cppPath + "\" -o \"" + output + "\"";
+        filesystem::path compilerDir = filesystem::absolute(filesystem::path(argv[0])).parent_path();
+        filesystem::path root = compilerDir;
+        filesystem::path binDir = root / ".bin";
+        filesystem::create_directories(binDir);
+        filesystem::path core = root / "core";
+        vector<filesystem::path> objects = {
+            root / "runtime.o", root / "math.o", root / "path.o", root / "network.o", root / "http.o",
+            core / "runtime" / "runtime.o", core / "math" / "math.o", core / "path" / "path.o",
+            core / "network" / "network.o", core / "http" / "http.o"
+        };
+        string cmd = "g++ -std=c++17 \"" + cppPath + "\"";
+        for (const auto& obj : objects) if (filesystem::exists(obj)) cmd += " \"" + obj.string() + "\"";
+        cmd += " -o \"" + output + "\"";
+#ifdef _WIN32
+        cmd += " -lws2_32";
+#endif
         cout << "HBPL: compilando...\n";
         int rc = std::system(cmd.c_str());
 
