@@ -9,7 +9,7 @@ app.listen(port)
 @app.get("/")
 fn home(request req, response res)>
     res.sendfile(path.join(path.currentDir, "html/index.html"))
-end
+end 
 
 fn main()>
     app.start()
