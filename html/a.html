@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registro | HBPL</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --text: #1c1e21;
+    --muted: #6b7280;
+    --border: #d1d5db;
+    --accent: #2563eb;
+    --ok: #15803d;
+    --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111318;
+      --card: #1b1e26;
+      --text: #e8eaed;
+      --muted: #9aa0ab;
+      --border: #333844;
+      --accent: #60a5fa;
+      --ok: #4ade80;
+      --err: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main {
+    width: 100%;
+    max-width: 420px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+  }
+  h1 { margin: 0 0 4px; font-size: 1.4rem; }
+  p.sub { margin: 0 0 22px; color: var(--muted); font-size: .9rem; }
+  label { display: block; margin-bottom: 14px; font-size: .85rem; color: var(--muted); }
+  input {
+    display: block;
+    width: 100%;
+    margin-top: 6px;
+    padding: 10px 12px;
+    font-size: 1rem;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    width: 100%;
+    margin-top: 6px;
+    padding: 11px;
+    font-size: 1rem;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent);
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: wait; }
+  #estado { margin-top: 16px; font-size: .9rem; min-height: 1.2em; word-break: break-word; }
+  #estado.ok { color: var(--ok); }
+  #estado.err { color: var(--err); }
+  pre {
+    margin: 10px 0 0;
+    padding: 10px 12px;
+    font-size: .8rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+  pre:empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Registro</h1>
+  <p class="sub">Formulario de prueba: envía un POST a <code>/enviar</code>.</p>
+
+  <form id="form" novalidate>
+    <label>Nombre
+      <input name="nombre" type="text" autocomplete="name" required>
+    </label>
+    <label>Correo
+      <input name="correo" type="email" autocomplete="email" required>
+    </label>
+    <label>Edad
+      <input name="edad" type="number" min="1" max="120" required>
+    </label>
+    <button id="boton" type="submit">Registrarme</button>
+  </form>
+
+  <div id="estado" role="status"></div>
+  <pre id="respuesta"></pre>
+</main>
+
+<script>
+  const form = document.getElementById("form");
+  const boton = document.getElementById("boton");
+  const estado = document.getElementById("estado");
+  const respuesta = document.getElementById("respuesta");
+
+  function mostrar(texto, clase) {
+    estado.textContent = texto;
+    estado.className = clase || "";
+  }
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    respuesta.textContent = "";
+
+    const datos = new FormData(form);
+    const nombre = (datos.get("nombre") || "").trim();
+    const correo = (datos.get("correo") || "").trim();
+    const edad = (datos.get("edad") || "").trim();
+
+    if (!nombre || !correo || !edad) {
+      mostrar("Completa todos los campos.", "err");
+      return;
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(correo)) {
+      mostrar("El correo no parece válido.", "err");
+      return;
+    }
+
+    // El servidor HBPL recibe el cuerpo crudo: nombre=...&correo=...&edad=...
+    const cuerpo = new URLSearchParams({ nombre, correo, edad });
+
+    boton.disabled = true;
+    mostrar("Enviando...");
+
+    try {
+      const res = await fetch("/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: cuerpo.toString()
+      });
+
+      const texto = await res.text();
+
+      if (res.ok) {
+        mostrar("Registro enviado (HTTP " + res.status + ").", "ok");
+        form.reset();
+      } else {
+        mostrar("El servidor respondió HTTP " + res.status + ".", "err");
+      }
+      respuesta.textContent = texto;
+    } catch (e) {
+      mostrar("No se pudo conectar con el servidor.", "err");
+    } finally {
+      boton.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

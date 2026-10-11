@@ -1,16 +1,25 @@
-import Network using http , http.types
+import Network using http, http.types
 import path
 
 const server app = http.init()
 const int port = 5000
-app.listen(port)
-
 
 @app.get("/")
-fn home(request req,response res)>
-    res.sendfile(path.join(path.currentDir,"/html/index.html")
-    end
+fn home(request req, response res)>
+    res.sendfile(path.join(path.currentDir(), "html/index.html"))
+end
 
+@app.get("/home")
+fn a(request req, response res)>
+    res.sendfile(path.join(path.currentDir(), "html/a.html"))
+end
+@app.post("/enviar")
+fn enviar(request req, response res)>
+    Console.Log("Registro recibido: " + req.body)
+    res.type("text/plain; charset=utf-8")
+    res.send("Registro recibido: " + req.body)
+end
 fn main()>
+    app.listen(port)
     app.start()
 end

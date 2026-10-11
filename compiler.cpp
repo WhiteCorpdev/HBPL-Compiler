@@ -1,34 +1,28 @@
-// HBPL Compiler v0.2 - bootstrap compiler
+// HBPL Compiler v0.8 - bootstrap compiler
 // Compiles HBPL -> C++17 -> native executable.
-// This is the first working backend; the frontend is designed to be replaced
-// by a native ASM backend later without changing the language frontend.
 //
 // Build:
 //   g++ -std=c++17 compiler.cpp -o compiler
 //
 // Use:
 //   compiler archivo.hbpl -o programa.exe
+//   compiler archivo.hbpl --emit-cpp archivo.cpp
 //
-// Supported in this version:
-//   - end blocks
-//   - // comments
-//   - primitive declarations + const
-//   - expressions/operators
-//   - functions + return
-//   - if / else if / else
-//   - while
-//   - simplified for
-//   - foreach
-//   - arrays and list<T>
-//   - class, visibility, me, onCreated, new
-//   - override
-//   - Ext(Base)
+// Novedades v0.8:
+//   - decoradores:            @app.get("/")  (y @manual dentro de funciones)
+//   - variables globales:     const server app = http.init()
+//   - import ... using ...:   import Network using http, http.types
+//   - tipos server/request/response (puentes a core/http)
+//   - modulo path (puente a core/path)
+//   - los strings ahora siempre se emiten como std::string("...")
+//   - el compilador enlaza automaticamente core/http/http.cpp y core/path/path.cpp
+//
+// Supported:
+//   - end blocks, // comments, primitives + const, expressions/operators
+//   - functions + return, if / else if / else, while, simplified for, foreach
+//   - arrays and list<T>, class, visibility, me, onCreated, new
 //   - Console.Log/Write/ReadLine/Clear/ReadKey
-//   - imports (validated/recorded; standard library names are accepted)
 //   - basic try/catch
-//
-// NOTE: generated C++ is compiled to native machine code by g++.
-// The next backend can replace emitCpp() with a direct ASM/IR backend.
 
 #include <algorithm>
 #include <cctype>
@@ -42,6 +36,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -88,7 +83,8 @@ enum class TK {
     Plus, Minus, Star, Slash, Percent,
     Equal, EqualEqual, Bang, BangEqual,
     Less, LessEqual, Greater, GreaterEqual,
-    AndAnd, OrOr
+    AndAnd, OrOr,
+    At
 };
 
 struct Token {
@@ -242,6 +238,7 @@ public:
                 case '=': out.push_back({TK::Equal,"=",at}); break;
                 case '!': out.push_back({TK::Bang,"!",at}); break;
                 case '<': out.push_back({TK::Less,"<",at}); break;
+                case '@': out.push_back({TK::At,"@",at}); break;
                 default: fail(at, string("caracter inesperado '") + c + "'");
             }
         }
@@ -257,6 +254,7 @@ struct Expr {
     enum Kind { Literal, Variable, Binary, Unary, Call, Member, NewObject, Array } kind;
     SourcePos pos;
     string value;
+    bool isString = false;
     vector<shared_ptr<Expr>> args;
     shared_ptr<Expr> left, right;
 };
@@ -285,6 +283,7 @@ struct Function {
     bool isMethod = false;
     string owner;
     bool isOverride = false;
+    vector<shared_ptr<Expr>> decorators;   // @app.get("/")
 };
 
 struct Field {
@@ -303,8 +302,15 @@ struct Program {
     vector<string> imports;
     vector<Function> functions;
     vector<ClassDef> classes;
+    vector<shared_ptr<Stmt>> globals;      // variables globales
     string codeSpace;
 };
+
+static bool hasImport(const Program& p, const string& needle) {
+    for (const auto& i : p.imports)
+        if (i.find(needle) != string::npos) return true;
+    return false;
+}
 
 // ------------------------------------------------------------
 // Parser
@@ -373,7 +379,9 @@ class Parser {
 
         if (is(TK::String) || is(TK::Number)) {
             take();
-            return make(Expr::Literal, x.pos, x.text);
+            auto e = make(Expr::Literal, x.pos, x.text);
+            e->isString = (x.kind == TK::String);
+            return e;
         }
 
         if (is(TK::KwTrue) || is(TK::KwFalse) || is(TK::KwNull)) {
@@ -398,7 +406,10 @@ class Parser {
 
             while (true) {
                 if (eat(TK::Dot)) {
-                    Token m = expect(TK::Ident, "se esperaba nombre después de '.'");
+                    // tras '.', cualquier palabra vale (res.type, req.in, ...)
+                    Token m = take();
+                    if (m.text.empty() || !(isalpha((unsigned char)m.text[0]) || m.text[0] == '_'))
+                        fail(m.pos, "se esperaba nombre después de '.'");
                     auto n = make(Expr::Member, m.pos, m.text);
                     n->left = e;
                     e = n;
@@ -573,14 +584,17 @@ class Parser {
         return c;
     }
 
-
-
 public:
     explicit Parser(vector<Token> toks) : t(move(toks)) {}
 
     Program parse() {
         Program p;
+        vector<shared_ptr<Expr>> pending;   // decoradores pendientes
+
         while (!is(TK::End)) {
+
+            // import a.b
+            // import Network using http, http.types
             if (eat(TK::KwImport)) {
                 Token n = take();
                 if (n.kind != TK::Ident) fail(n.pos, "se esperaba nombre de librería");
@@ -588,7 +602,18 @@ public:
                 while (eat(TK::Dot)) {
                     name += "." + expect(TK::Ident, "se esperaba parte del import").text;
                 }
-                p.imports.push_back(name);
+
+                if (is(TK::Ident) && cur().text == "using") {
+                    take();
+                    do {
+                        string sub = expect(TK::Ident, "se esperaba nombre después de using").text;
+                        while (eat(TK::Dot))
+                            sub += "." + expect(TK::Ident, "se esperaba parte del import").text;
+                        p.imports.push_back(name + "::" + sub);
+                    } while (eat(TK::Comma));
+                } else {
+                    p.imports.push_back(name);
+                }
                 continue;
             }
 
@@ -599,13 +624,29 @@ public:
                 continue;
             }
 
+            // @decorador  /  @app.get("/")
+            if (eat(TK::At)) {
+                pending.push_back(expression());
+                continue;
+            }
+
             if (is(TK::KwClass)) {
                 p.classes.push_back(parseClass());
                 continue;
             }
 
             if (is(TK::KwFn) || is(TK::KwOnCreated)) {
-                p.functions.push_back(parseFunction());
+                Function f = parseFunction();
+                f.decorators = move(pending);
+                pending.clear();
+                p.functions.push_back(move(f));
+                continue;
+            }
+
+            // variable global
+            if (is(TK::KwConst) || isTypeName(cur().kind) ||
+                (is(TK::Ident) && i + 1 < t.size() && t[i+1].kind == TK::Ident)) {
+                p.globals.push_back(variableDecl());
                 continue;
             }
 
@@ -619,12 +660,23 @@ public:
 
             fail(cur().pos, "declaración global no soportada");
         }
+
+        if (!pending.empty())
+            fail(cur().pos, "decorador sin función a continuación");
+
         return p;
     }
 };
 
 shared_ptr<Stmt> Parser::statement() {
         Token x = cur();
+
+        // @manual (marcador dentro de funciones; sin efecto en el backend C++)
+        if (eat(TK::At)) {
+            expect(TK::Ident, "se esperaba nombre después de '@'");
+            auto s = make_shared<Stmt>(); s->kind = Stmt::Block; s->pos = x.pos;
+            return s;
+        }
 
         if (is(TK::KwConst) || isTypeName(cur().kind) ||
             (is(TK::Ident) && i + 1 < t.size() && t[i+1].kind == TK::Ident)) {
@@ -653,7 +705,6 @@ shared_ptr<Stmt> Parser::statement() {
             s->body = block();
             if (eat(TK::KwElse)) {
                 if (is(TK::KwIf)) {
-                    // No consumir el 'if': statement() lo hace.
                     // El if anidado consume el 'end' compartido.
                     s->elseBody.push_back(statement());
                     return s;
@@ -664,7 +715,8 @@ shared_ptr<Stmt> Parser::statement() {
                 return s;
             }
             expect(TK::KwEnd, "se esperaba end");
-            return s;}
+            return s;
+        }
 
         if (eat(TK::KwWhile)) {
             auto s = make_shared<Stmt>(); s->kind = Stmt::While; s->pos = x.pos;
@@ -765,6 +817,7 @@ class Analyzer {
         if (!e) return "int";
         switch (e->kind) {
             case Expr::Literal:
+                if (e->isString) return "str";
                 if (e->value == "true" || e->value == "false") return "bool";
                 if (e->value == "null") return "null";
                 if (e->value.find('.') != string::npos) return "double";
@@ -884,10 +937,18 @@ public:
 
         if (!funcs.count("main")) fail({1,1}, "falta fn main()");
 
+        // variables globales
+        unordered_map<string,Symbol> globalEnv;
+        for (auto& g : p.globals) {
+            if (globalEnv.count(g->name)) fail(g->pos, "variable global redeclarada: " + g->name);
+            globalEnv[g->name] = {g->type, g->isConst, true};
+            if (g->expr) exprType(g->expr, globalEnv);
+        }
+
         for (auto& f : p.functions) {
-            unordered_map<string,Symbol> env;
+            unordered_map<string,Symbol> env = globalEnv;
             for (auto& a : f.params) {
-                if (env.count(a.name)) fail({1,1}, "parámetro duplicado: " + a.name);
+                // un parametro puede ocultar a una global
                 env[a.name] = {a.type, false, true};
             }
             for (auto& s : f.body) stmt(s, env);
@@ -905,12 +966,20 @@ class CppBackend {
     int indent = 0;
     unordered_map<string, string> listElementTypes;
     unordered_map<string, string> localTypes;
+    bool useHttp = false;
+    bool usePath = false;
 
     string ind() const { return string(indent * 4, ' '); }
 
     bool isClassType(const string& t) const {
         for (const auto& c : p.classes)
             if (c.name == t) return true;
+        return false;
+    }
+
+    bool hasFinish() const {
+        for (const auto& f : p.functions)
+            if (f.name == "finish") return true;
         return false;
     }
 
@@ -931,6 +1000,8 @@ class CppBackend {
         if (t == "double") return "double";
         if (t == "bool") return "bool";
         if (t == "null") return "std::nullptr_t";
+        // tipos de red: handles opacos del runtime
+        if (t == "server" || t == "request" || t == "response") return "void*";
         if (t.size() > 2 && t.substr(t.size()-2) == "[]")
             return "std::vector<" + cppType(t.substr(0,t.size()-2)) + ">";
         if (t == "list") return "std::vector<std::shared_ptr<void>>";
@@ -996,30 +1067,104 @@ class CppBackend {
         }
     }
 
+    // Prepara los mapas de tipos para emitir el cuerpo de f:
+    // globales + parametros + locales.
+    void beginScope(const Function& f) {
+        listElementTypes.clear();
+        localTypes.clear();
+        for (auto& g : p.globals) localTypes[g->name] = g->type;
+        for (auto& a : f.params) localTypes[a.name] = a.type;
+        collectListTypes(f.body);
+    }
+
+    static string escapeString(const string& v) {
+        string z = "std::string(\"";
+        for (char c : v) {
+            switch (c) {
+                case '\\': z += "\\\\"; break;
+                case '"':  z += "\\\""; break;
+                case '\n': z += "\\n"; break;
+                case '\t': z += "\\t"; break;
+                case '\r': z += "\\r"; break;
+                default: z += c;
+            }
+        }
+        return z + "\")";
+    }
+
+    string typeOfVar(const string& name) const {
+        auto it = localTypes.find(name);
+        return it == localTypes.end() ? "" : it->second;
+    }
+
+    // Llamadas a la libreria estandar de HBPL (http, path, server, response).
+    // Devuelve "" si la llamada no es de libreria.
+    string libraryCall(const shared_ptr<Expr>& e) {
+        if (!e->left || e->left->kind != Expr::Member) return "";
+        auto m = e->left;
+        if (!m->left || m->left->kind != Expr::Variable) return "";
+
+        const string& recv = m->left->value;
+        const string& name = m->value;
+        string rt = typeOfVar(recv);
+
+        // modulos estaticos (solo si no hay una variable con ese nombre)
+        if (rt.empty()) {
+            if (recv == "http" && name == "init") {
+                if (!useHttp) return "";
+                return "hbpl_http_create()";
+            }
+            if (recv == "path" && usePath) {
+                static const unordered_map<string,string> fns = {
+                    {"join","path_join"},{"currentDir","path_currentDir"},
+                    {"exists","path_exists"},{"isFile","path_isFile"},
+                    {"isDir","path_isDir"},{"filename","path_filename"},
+                    {"extension","path_extension"},{"parent","path_parent"}
+                };
+                auto it = fns.find(name);
+                if (it != fns.end())
+                    return "hbpl::" + it->second + "(" + joinArgs(e->args) + ")";
+            }
+            return "";
+        }
+
+        if (rt == "server" && useHttp) {
+            if (name == "listen" && e->args.size() == 1)
+                return "hbpl::listen(" + recv + ", " + expr(e->args[0]) + ")";
+            if (name == "start") return "hbpl_http_start(" + recv + ")";
+            if (name == "stop")  return "hbpl_http_stop(" + recv + ")";
+            if ((name == "get" || name == "post") && e->args.size() == 2)
+                return "hbpl_http_" + name + "(" + recv + ", " + expr(e->args[0]) +
+                       ".c_str(), " + expr(e->args[1]) + ")";
+        }
+
+        if (rt == "request" && useHttp && e->args.empty()) {
+            if (name == "body" || name == "path" || name == "method" || name == "query")
+                return "hbpl::req_" + name + "(" + recv + ")";
+        }
+
+        if (rt == "response" && useHttp) {
+            if (name == "type" && e->args.size() == 1)
+                return "hbpl_http_response_type(" + recv + ", " + expr(e->args[0]) + ".c_str())";
+            if (name == "sendfile" && e->args.size() == 1)
+                return "hbpl_http_response_sendfile(" + recv + ", " + expr(e->args[0]) + ".c_str())";
+            if (name == "send" && e->args.size() == 1)
+                return "hbpl_http_response_send(" + recv + ", " + expr(e->args[0]) + ".c_str())";
+            if (name == "status" && e->args.size() == 1)
+                return "hbpl_http_response_status(" + recv + ", " + expr(e->args[0]) + ")";
+        }
+
+        return "";
+    }
+
     string expr(shared_ptr<Expr> e) {
         if (!e) return "0";
         switch (e->kind) {
             case Expr::Literal:
+                if (e->isString) return escapeString(e->value);
                 if (e->value == "true") return "true";
                 if (e->value == "false") return "false";
                 if (e->value == "null") return "nullptr";
-                if (e->value.find('\n') != string::npos) {
-                    string q = e->value;
-                    string z = "\"";
-                    for (char c : q) {
-                        if (c == '"') z += "\\\"";
-                        else if (c == '\n') z += "\\n";
-                        else if (c == '\t') z += "\\t";
-                        else z += c;
-                    }
-                    return z + "\"";
-                }
-                // String literals are represented directly with quotes.
-                // Numeric literals are returned as-is.
-                if (!e->value.empty() && !isdigit((unsigned char)e->value[0]) &&
-                    e->value.find('.') == string::npos) {
-                    return "\"" + e->value + "\"";
-                }
                 return e->value;
 
             case Expr::Variable:
@@ -1040,8 +1185,13 @@ class CppBackend {
                 if (e->value == "pop") return base + ".pop_back";
                 if (e->value == "clear") return base + ".clear";
                 if (base == "this") return "this->" + e->value;
+                // propiedades de request: req.body / req.path / req.method / req.query
+                if (useHttp && e->left && e->left->kind == Expr::Variable &&
+                    typeOfVar(e->left->value) == "request" &&
+                    (e->value == "body" || e->value == "path" ||
+                     e->value == "method" || e->value == "query"))
+                    return "hbpl::req_" + e->value + "(" + base + ")";
                 // Class variables are emitted as shared_ptr<T>.
-                // Known STL/string members keep '.', other object members use '->'.
                 if (e->left && e->left->kind == Expr::Variable) {
                     const string& n = e->left->value;
                     if (n != "Console") return base + "->" + e->value;
@@ -1056,11 +1206,11 @@ class CppBackend {
                     e->left->left->value == "Console") {
                     string m = e->left->value;
                     if (m == "Log") {
-                        string a = e->args.empty() ? "\"\"" : expr(e->args[0]);
+                        string a = e->args.empty() ? "std::string()" : expr(e->args[0]);
                         return "hbpl::log(" + a + ")";
                     }
                     if (m == "Write") {
-                        string a = e->args.empty() ? "\"\"" : expr(e->args[0]);
+                        string a = e->args.empty() ? "std::string()" : expr(e->args[0]);
                         return "hbpl::write(" + a + ")";
                     }
                     if (m == "ReadLine") return "hbpl::readLine()";
@@ -1068,11 +1218,17 @@ class CppBackend {
                     if (m == "ReadKey") return "hbpl::readKey()";
                 }
 
+                // http / path / server / response
+                {
+                    string lib = libraryCall(e);
+                    if (!lib.empty()) return lib;
+                }
+
                 // str(x) conversion
                 if (e->left && e->left->kind == Expr::Variable && e->left->value == "str" && e->args.size() == 1)
-                    return "std::to_string(" + expr(e->args[0]) + ")";
+                    return "hbpl::toStr(" + expr(e->args[0]) + ")";
 
-                // list.push(a,b) becomes two push_back calls.
+                // list.push(a,b) becomes several push_back calls.
                 if (e->left && e->left->kind == Expr::Member && e->left->value == "push") {
                     string z = "[&](){";
                     for (auto& a : e->args) z += expr(e->left->left) + ".push_back(" + expr(a) + ");";
@@ -1111,9 +1267,14 @@ class CppBackend {
 
     void stmt(shared_ptr<Stmt> s) {
         switch (s->kind) {
-            case Stmt::VarDecl:
-                o << ind() << (s->isConst ? "const " : "")
-                  << declaredType(s->type, s->name) << " " << s->name;
+            case Stmt::VarDecl: {
+                string ty = declaredType(s->type, s->name);
+                bool ptr = !ty.empty() && ty.back() == '*';
+                o << ind();
+                if (s->isConst && !ptr) o << "const ";
+                o << ty;
+                if (s->isConst && ptr) o << " const";   // puntero constante, no puntero a const
+                o << " " << s->name;
                 if (s->expr) {
                     if (s->type == "list" && s->expr->kind == Expr::NewObject && s->expr->value == "list")
                         o << "{}";
@@ -1122,6 +1283,7 @@ class CppBackend {
                 }
                 o << ";\n";
                 break;
+            }
 
             case Stmt::Assign:
                 o << ind() << expr(s->expr) << " = " << expr(s->args[0]) << ";\n";
@@ -1144,7 +1306,6 @@ class CppBackend {
                 if (!s->elseBody.empty()) {
                     o << " else ";
                     if (s->elseBody.size() == 1 && s->elseBody[0]->kind == Stmt::If) {
-                        // Simplified nested output.
                         o << "{\n"; ++indent; stmt(s->elseBody[0]); --indent; o << ind() << "}";
                     } else {
                         o << "{\n"; ++indent;
@@ -1203,7 +1364,7 @@ class CppBackend {
                 o << ind() << "continue;\n";
                 break;
 
-            default: break;
+            default: break;   // Block (@manual) no emite nada
         }
     }
 
@@ -1211,7 +1372,6 @@ class CppBackend {
         if (param.type != "auto") return param.type;
         // Infer constructor parameters from assignments such as:
         // me.nombre = nombre
-        // me.grado = grado
         if (f.name == "onCreated") {
             for (const auto& st : f.body) {
                 if (st->kind != Stmt::Assign || !st->expr || st->expr->kind != Expr::Member) continue;
@@ -1225,6 +1385,7 @@ class CppBackend {
     }
 
     void method(const Function& f, const string& owner) {
+        beginScope(f);
         if (f.name == "onCreated") o << owner << "::" << owner << "(";
         else o << cppType(f.returnType.empty() ? "void" : f.returnType) << " " << owner << "::" << f.name << "(";
         bool first = true;
@@ -1241,8 +1402,46 @@ class CppBackend {
         o << "}\n\n";
     }
 
+    string functionSignature(const Function& f) {
+        string fn = (f.name == "main") ? "hbpl_main" : f.name;
+        string ret = cppType((f.returnType.empty() && f.name != "main") ? "void"
+                             : (f.returnType.empty() ? "int" : f.returnType));
+        string z = ret + " " + fn + "(";
+        for (size_t i=0;i<f.params.size();++i) {
+            if (i) z += ", ";
+            z += cppType(f.params[i].type) + " " + f.params[i].name;
+        }
+        return z + ")";
+    }
+
+    // Registra las rutas declaradas con decoradores:
+    //   @app.get("/")  ->  hbpl_http_get(app, "/", home);
+    void emitRoutes() {
+        for (auto& f : p.functions) {
+            for (auto& d : f.decorators) {
+                if (!d || d->kind != Expr::Call || !d->left || d->left->kind != Expr::Member ||
+                    !d->left->left || d->left->left->kind != Expr::Variable)
+                    continue;
+
+                const string& target = d->left->left->value;
+                const string& verb = d->left->value;
+
+                if (typeOfVar(target) != "server")
+                    fail(d->pos, "el decorador debe aplicarse sobre una variable de tipo server: " + target);
+                if ((verb != "get" && verb != "post") || d->args.size() != 1)
+                    fail(d->pos, "decorador no soportado: @" + target + "." + verb + " (use get/post con una ruta)");
+
+                o << ind() << "hbpl_http_" << verb << "(" << target << ", "
+                  << expr(d->args[0]) << ".c_str(), " << f.name << ");\n";
+            }
+        }
+    }
+
 public:
-    CppBackend(Program& x, ostream& out) : p(x), o(out) {}
+    CppBackend(Program& x, ostream& out) : p(x), o(out) {
+        useHttp = hasImport(p, "http");
+        usePath = hasImport(p, "path");
+    }
 
     void emit() {
         o << "#include <iostream>\n"
@@ -1253,6 +1452,38 @@ public:
              "#include <cstdlib>\n"
              "#include <cmath>\n"
              "#include <limits>\n\n";
+
+        // ---- puentes al core de HBPL ----
+        if (useHttp) {
+            o << "extern \"C\" {\n"
+                 "void* hbpl_http_create();\n"
+                 "bool hbpl_http_listen(void* server, int port);\n"
+                 "void hbpl_http_start(void* server);\n"
+                 "void hbpl_http_stop(void* server);\n"
+                 "void hbpl_http_get(void* server, const char* path, void (*handler)(void*, void*));\n"
+                 "void hbpl_http_post(void* server, const char* path, void (*handler)(void*, void*));\n"
+                 "char* hbpl_http_request_method(void* request);\n"
+                 "char* hbpl_http_request_path(void* request);\n"
+                 "char* hbpl_http_request_query(void* request);\n"
+                 "char* hbpl_http_request_body(void* request);\n"
+                 "void hbpl_http_response_type(void* response, const char* type);\n"
+                 "void hbpl_http_response_status(void* response, int status);\n"
+                 "void hbpl_http_response_send(void* response, const char* data);\n"
+                 "void hbpl_http_response_sendfile(void* response, const char* path);\n"
+                 "}\n\n";
+        }
+        if (usePath) {
+            o << "extern \"C\" {\n"
+                 "char* hbpl_path_current_dir();\n"
+                 "char* hbpl_path_join(const char* a, const char* b);\n"
+                 "bool hbpl_path_exists(const char* path);\n"
+                 "bool hbpl_path_is_file(const char* path);\n"
+                 "bool hbpl_path_is_dir(const char* path);\n"
+                 "char* hbpl_path_filename(const char* path);\n"
+                 "char* hbpl_path_extension(const char* path);\n"
+                 "char* hbpl_path_parent(const char* path);\n"
+                 "}\n\n";
+        }
 
         o << "namespace hbpl {\n"
              "template<class T> void log(const T& x){ std::cout << x << '\\n'; }\n"
@@ -1267,8 +1498,45 @@ public:
              "#endif\n"
              "}\n"
              "inline char readKey(){ char c=0; std::cin.get(c); return c; }\n"
-             "}\n\n";
+             "inline std::string toStr(const std::string& x){ return x; }\n"
+             "inline std::string toStr(const char* x){ return std::string(x); }\n"
+             "template<class T> std::string toStr(const T& x){ return std::to_string(x); }\n";
 
+        if (usePath || useHttp)
+            o << "inline std::string takeStr(char* s){ std::string r = s ? s : \"\"; std::free(s); return r; }\n";
+        if (useHttp) {
+            o << "inline std::string req_method(void* r){ return takeStr(hbpl_http_request_method(r)); }\n"
+                 "inline std::string req_path(void* r){ return takeStr(hbpl_http_request_path(r)); }\n"
+                 "inline std::string req_query(void* r){ return takeStr(hbpl_http_request_query(r)); }\n"
+                 "inline std::string req_body(void* r){ return takeStr(hbpl_http_request_body(r)); }\n";
+        }
+        if (usePath) {
+            o << "inline std::string path_currentDir(){ return takeStr(hbpl_path_current_dir()); }\n"
+                 // quita los '/' iniciales de b para que join no descarte a
+                 "inline std::string path_join(const std::string& a, const std::string& b){\n"
+                 "    size_t k = 0;\n"
+                 "    while (k < b.size() && (b[k] == '/' || b[k] == '\\\\')) ++k;\n"
+                 "    return takeStr(hbpl_path_join(a.c_str(), b.substr(k).c_str()));\n"
+                 "}\n"
+                 "inline bool path_exists(const std::string& a){ return hbpl_path_exists(a.c_str()); }\n"
+                 "inline bool path_isFile(const std::string& a){ return hbpl_path_is_file(a.c_str()); }\n"
+                 "inline bool path_isDir(const std::string& a){ return hbpl_path_is_dir(a.c_str()); }\n"
+                 "inline std::string path_filename(const std::string& a){ return takeStr(hbpl_path_filename(a.c_str())); }\n"
+                 "inline std::string path_extension(const std::string& a){ return takeStr(hbpl_path_extension(a.c_str())); }\n"
+                 "inline std::string path_parent(const std::string& a){ return takeStr(hbpl_path_parent(a.c_str())); }\n";
+        }
+        if (useHttp) {
+            o << "inline void listen(void* s, int port){\n"
+                 "    if (!hbpl_http_listen(s, port)) {\n"
+                 "        std::cerr << \"HBPL Error: no se pudo escuchar en el puerto \" << port << \"\\n\";\n"
+                 "        std::exit(1);\n"
+                 "    }\n"
+                 "    std::cout << \"HBPL: servidor escuchando en http://localhost:\" << port << \"\\n\";\n"
+                 "}\n";
+        }
+        o << "}\n\n";
+
+        // ---- clases ----
         for (auto& c : p.classes) {
             o << "struct " << c.name;
             if (!c.base.empty()) o << " : public " << c.base;
@@ -1296,37 +1564,31 @@ public:
             o << "};\n\n";
         }
 
-        // Global functions need declarations first.
-        for (auto& f : p.functions) {
-            listElementTypes.clear();
-            localTypes.clear();
-            collectListTypes(f.body);
-            string fn = (f.name == "main") ? "hbpl_main" : f.name;
-            o << cppType((f.returnType.empty() && f.name != "main") ? "void" : (f.returnType.empty() ? "int" : f.returnType)) << " " << fn << "(";
-            for (size_t i=0;i<f.params.size();++i) {
-                if (i) o << ", ";
-                o << cppType(f.params[i].type) << " " << f.params[i].name;
-            }
-            o << ");\n";
-        }
+        // ---- prototipos de funciones globales ----
+        for (auto& f : p.functions)
+            o << functionSignature(f) << ";\n";
+        if (!hasFinish()) o << "inline void finish() {}\n";
         o << "\n";
 
+        // ---- variables globales ----
+        if (!p.globals.empty()) {
+            Function none;
+            beginScope(none);
+            for (auto& g : p.globals) stmt(g);
+            o << "\n";
+        }
+
+        // ---- metodos ----
         for (auto& c : p.classes)
             for (auto& f : c.methods)
                 method(f, c.name);
 
+        // ---- funciones globales ----
         for (auto& f : p.functions) {
-            listElementTypes.clear();
-            localTypes.clear();
-            collectListTypes(f.body);
-            string fn = (f.name == "main") ? "hbpl_main" : f.name;
-            o << cppType((f.returnType.empty() && f.name != "main") ? "void" : (f.returnType.empty() ? "int" : f.returnType)) << " " << fn << "(";
-            for (size_t i=0;i<f.params.size();++i) {
-                if (i) o << ", ";
-                o << cppType(f.params[i].type) << " " << f.params[i].name;
-            }
-            o << ") {\n";
+            beginScope(f);
+            o << functionSignature(f) << " {\n";
             ++indent;
+            if (f.name == "main") emitRoutes();
             for (auto& s : f.body) stmt(s);
             if (f.name == "main") o << ind() << "return 0;\n";
             --indent;
@@ -1349,19 +1611,35 @@ static string readFile(const string& path) {
 }
 
 static void usage() {
-    cout << "HBPL Compiler v0.7\n"
+    cout << "HBPL Compiler v0.8\n"
          << "Uso:\n"
          << "  compiler archivo.hbpl -o programa.exe\n"
          << "  compiler archivo.hbpl --emit-cpp archivo.cpp\n";
 }
-static void ver()
-{
-    cout << "v0.7";
 
+static void ver() {
+    cout << "v0.8\n";
 }
+
+// Busca la carpeta core/ (cwd, junto al compilador, o un nivel arriba).
+static filesystem::path findCore(const char* argv0) {
+    error_code ec;
+    vector<filesystem::path> candidates;
+    candidates.push_back(filesystem::current_path(ec) / "core");
+    auto exeDir = filesystem::weakly_canonical(argv0, ec).parent_path();
+    candidates.push_back(exeDir / "core");
+    candidates.push_back(exeDir / ".." / "core");
+    for (auto& c : candidates)
+        if (filesystem::is_directory(c, ec)) return c;
+    return {};
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) { usage(); return 1; }
+
+        if (string(argv[1]) == "--ver") { ver(); return 0; }
+        if (string(argv[1]) == "--help") { usage(); return 0; }
 
         string input = argv[1];
         string output = "./.bin/main.exe";
@@ -1370,7 +1648,7 @@ int main(int argc, char** argv) {
         for (int i=2;i<argc;++i) {
             string a = argv[i];
             if (a == "-o" && i+1 < argc) output = argv[++i];
-            else if (a == "--ver") {ver();return 0;}
+            else if (a == "--ver") { ver(); return 0; }
             else if (a == "--emit-cpp" && i+1 < argc) emitCpp = argv[++i];
             else if (a == "--help") { usage(); return 0; }
             else throw runtime_error("opción desconocida: " + a);
@@ -1390,24 +1668,52 @@ int main(int argc, char** argv) {
             ? (filesystem::temp_directory_path() / "hbpl_generated.cpp").string()
             : emitCpp;
 
-        ofstream cpp(cppPath);
-        if (!cpp) throw runtime_error("no se pudo crear: " + cppPath);
+        {
+            ofstream cpp(cppPath);
+            if (!cpp) throw runtime_error("no se pudo crear: " + cppPath);
+            CppBackend backend(program, cpp);
+            backend.emit();
+        }
 
-        CppBackend backend(program, cpp);
-        backend.emit();
-        cpp.close();
+        bool needHttp = hasImport(program, "http");
+        bool needPath = hasImport(program, "path");
 
         if (!emitCpp.empty()) {
             cout << "HBPL: C++ generado en " << cppPath << "\n";
+            if (needHttp || needPath)
+                cout << "HBPL: recuerda enlazar los archivos de core/ al compilar ese .cpp\n";
             return 0;
         }
 
-        string cmd = "g++ -std=c++17 \"" + cppPath + "\" -o \"" + output + "\"";
+        // fuentes del core necesarias
+        vector<string> extra;
+        if (needHttp || needPath) {
+            auto core = findCore(argv[0]);
+            if (core.empty())
+                throw runtime_error("no se encontró la carpeta core/ (se busca junto al compilador y en el directorio actual)");
+            if (needHttp) extra.push_back((core / "http" / "http.cpp").string());
+            if (needPath) extra.push_back((core / "path" / "path.cpp").string());
+        }
+
+        // crear carpeta de salida
+        error_code ec;
+        auto outParent = filesystem::path(output).parent_path();
+        if (!outParent.empty()) filesystem::create_directories(outParent, ec);
+
+        string cmd = "g++ -std=c++17 \"" + cppPath + "\"";
+        for (auto& s : extra) cmd += " \"" + s + "\"";
+        cmd += " -o \"" + output + "\"";
+        if (needHttp) {
+#ifdef _WIN32
+            cmd += " -lws2_32";
+#else
+            cmd += " -pthread";
+#endif
+        }
+
         cout << "HBPL: compilando...\n";
         int rc = std::system(cmd.c_str());
-
-        if (!emitCpp.empty()) return rc;
-        filesystem::remove(cppPath);
+        filesystem::remove(cppPath, ec);
 
         if (rc != 0) {
             cerr << "HBPL Error: fallo el backend C++/linker.\n";

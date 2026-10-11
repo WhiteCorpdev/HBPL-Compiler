@@ -29,9 +29,21 @@ void hbpl_http_post(
     void (*handler)(void* request, void* response)
 );
 
+// ---- request: devuelven memoria malloc'd (liberar con free) ----
+char* hbpl_http_request_method(void* request);
+char* hbpl_http_request_path(void* request);
+char* hbpl_http_request_query(void* request);
+char* hbpl_http_request_body(void* request);
+
+// ---- response ----
 void hbpl_http_response_status(
     void* response,
     int status
+);
+
+void hbpl_http_response_type(
+    void* response,
+    const char* contentType
 );
 
 void hbpl_http_response_send(
