@@ -254,7 +254,7 @@ struct Expr {
     enum Kind { Literal, Variable, Binary, Unary, Call, Member, NewObject, Array } kind;
     SourcePos pos;
     string value;
-    bool isString = false;
+    bool isStr = false;
     vector<shared_ptr<Expr>> args;
     shared_ptr<Expr> left, right;
 };
@@ -306,9 +306,57 @@ struct Program {
     string codeSpace;
 };
 
-static bool hasImport(const Program& p, const string& needle) {
-    for (const auto& i : p.imports)
-        if (i.find(needle) != string::npos) return true;
+// ------------------------------------------------------------
+// Módulos nativos (core/)
+// ------------------------------------------------------------
+
+struct NativeFn {
+    string name, cname, ret;   // ret: "str" | "bool" | "longlong"
+    int argc;                  // todos los argumentos son str
+};
+
+static const vector<NativeFn>& pathFns() {
+    static const vector<NativeFn> f = {
+        {"currentDir",   "hbpl_path_current_dir",    "str",      0},
+        {"join",         "hbpl_path_join",           "str",      2},
+        {"exists",       "hbpl_path_exists",         "bool",     1},
+        {"isFile",       "hbpl_path_is_file",        "bool",     1},
+        {"isDir",        "hbpl_path_is_dir",         "bool",     1},
+        {"filename",     "hbpl_path_filename",       "str",      1},
+        {"extension",    "hbpl_path_extension",      "str",      1},
+        {"parent",       "hbpl_path_parent",         "str",      1},
+        {"fileCreate",   "hbpl_path_file_create",    "bool",     1},
+        {"fileRead",     "hbpl_path_file_read",      "str",      1},
+        {"fileWrite",    "hbpl_path_file_write",     "bool",     2},
+        {"fileAppend",   "hbpl_path_file_append",    "bool",     2},
+        {"fileDelete",   "hbpl_path_file_delete",    "bool",     1},
+        {"fileCopy",     "hbpl_path_file_copy",      "bool",     2},
+        {"fileSize",     "hbpl_path_file_size",      "longlong", 1},
+        {"dirCreate",    "hbpl_path_dir_create",     "bool",     1},
+        {"dirList",      "hbpl_path_dir_list",       "str",      1},
+        {"dirDelete",    "hbpl_path_dir_delete",     "bool",     1},
+        {"dirDeleteAll", "hbpl_path_dir_delete_all", "bool",     1},
+        {"dirCopy",      "hbpl_path_dir_copy",       "bool",     2},
+        {"rename",       "hbpl_path_rename",         "bool",     2},
+    };
+    return f;
+}
+
+static const NativeFn* findPathFn(const string& name) {
+    for (auto& f : pathFns())
+        if (f.name == name) return &f;
+    return nullptr;
+}
+
+static bool hasImport(const Program& p, const string& m) {
+    for (auto& i : p.imports) {
+        if (i == m) return true;
+        // "Network::http"  ->  coincide con "http"
+        string suffix = "::" + m;
+        if (i.size() > suffix.size() &&
+            i.compare(i.size() - suffix.size(), suffix.size(), suffix) == 0)
+            return true;
+    }
     return false;
 }
 
@@ -378,9 +426,10 @@ class Parser {
         }
 
         if (is(TK::String) || is(TK::Number)) {
+            bool isString = is(TK::String);
             take();
             auto e = make(Expr::Literal, x.pos, x.text);
-            e->isString = (x.kind == TK::String);
+            e->isStr = isString;
             return e;
         }
 
@@ -817,7 +866,7 @@ class Analyzer {
         if (!e) return "int";
         switch (e->kind) {
             case Expr::Literal:
-                if (e->isString) return "str";
+                if (e->isStr) return "str";
                 if (e->value == "true" || e->value == "false") return "bool";
                 if (e->value == "null") return "null";
                 if (e->value.find('.') != string::npos) return "double";
@@ -858,9 +907,32 @@ class Analyzer {
                     auto it = funcs.find(e->left->value);
                     if (it != funcs.end()) return it->second->returnType;
                 }
+                if (e->left && e->left->kind == Expr::Member && e->left->left &&
+                    e->left->left->kind == Expr::Variable && e->left->left->value == "path" &&
+                    hasImport(p, "path") && !env.count("path")) {
+
+                    auto* nf = findPathFn(e->left->value);
+                    if (!nf)
+                        fail(e->pos, "path no tiene la función '" + e->left->value + "'");
+                    if ((int)e->args.size() != nf->argc)
+                        fail(e->pos, "path." + nf->name + " espera " +
+                                     to_string(nf->argc) + " argumento(s)");
+                    for (auto& a : e->args) {
+                        string t = exprType(a, env);
+                        if (t != "str" && t != "unknown" && t != "auto")
+                            fail(a->pos, "los argumentos de path." + nf->name + " deben ser str");
+                    }
+                    return nf->ret;
+                }
                 return "unknown";
             }
-            case Expr::Member: return "unknown";
+            case Expr::Member:
+                if (e->left && e->left->kind == Expr::Variable && e->left->value == "path" &&
+                    hasImport(p, "path") && !env.count("path") && e->value != "[]") {
+                    auto* nf = findPathFn(e->value);
+                    if (nf && nf->argc == 0) return nf->ret;   // path.currentDir
+                }
+                return "unknown";;
             case Expr::NewObject: return e->value;
             case Expr::Array: return "array";
         }
@@ -970,6 +1042,55 @@ class CppBackend {
     bool usePath = false;
 
     string ind() const { return string(indent * 4, ' '); }
+
+    bool isPathModule(const shared_ptr<Expr>& x) const {
+        return x && x->kind == Expr::Variable && x->value == "path" &&
+               hasImport(p, "path") && !localTypes.count("path");
+    }
+
+    static string quoteCpp(const string& s) {
+        string z = "\"";
+        for (char c : s) {
+            switch (c) {
+                case '\n': z += "\\n";  break;
+                case '\t': z += "\\t";  break;
+                case '\r': z += "\\r";  break;
+                case '\\': z += "\\\\"; break;
+                case '"':  z += "\\\""; break;
+                default:   z += c;
+            }
+        }
+        return z + "\"";
+    }
+
+    void emitPathModule() {
+        auto cRet = [](const string& r) {
+            return r == "str" ? "char*" : r == "bool" ? "bool" : "long long";
+        };
+        auto cppRet = [](const string& r) {
+            return r == "str" ? "std::string" : r == "bool" ? "bool" : "long long";
+        };
+
+        o << "extern \"C\" {\n";
+        for (auto& f : pathFns()) {
+            o << cRet(f.ret) << " " << f.cname << "(";
+            for (int i = 0; i < f.argc; ++i) o << (i ? ", " : "") << "const char*";
+            o << ");\n";
+        }
+        o << "}\n\nnamespace hbpl_path {\n"
+             "inline std::string take(char* p){ if(!p) return std::string(); "
+             "std::string s(p); std::free(p); return s; }\n";
+        for (auto& f : pathFns()) {
+            o << "inline " << cppRet(f.ret) << " " << f.name << "(";
+            for (int i = 0; i < f.argc; ++i)
+                o << (i ? ", " : "") << "const std::string& a" << i;
+            o << ") { return " << (f.ret == "str" ? "take(" : "") << f.cname << "(";
+            for (int i = 0; i < f.argc; ++i)
+                o << (i ? ", " : "") << "a" << i << ".c_str()";
+            o << ")" << (f.ret == "str" ? ")" : "") << "; }\n";
+        }
+        o << "}\n\n";
+    }
 
     bool isClassType(const string& t) const {
         for (const auto& c : p.classes)
@@ -1115,15 +1236,11 @@ class CppBackend {
                 return "hbpl_http_create()";
             }
             if (recv == "path" && usePath) {
-                static const unordered_map<string,string> fns = {
-                    {"join","path_join"},{"currentDir","path_currentDir"},
-                    {"exists","path_exists"},{"isFile","path_isFile"},
-                    {"isDir","path_isDir"},{"filename","path_filename"},
-                    {"extension","path_extension"},{"parent","path_parent"}
-                };
-                auto it = fns.find(name);
-                if (it != fns.end())
-                    return "hbpl::" + it->second + "(" + joinArgs(e->args) + ")";
+                if (name == "join")                  // join quita los '/' iniciales
+                    return "hbpl::path_join(" + joinArgs(e->args) + ")";
+                if (findPathFn(name))                // el resto, por la tabla
+                    return "hbpl_path::" + name + "(" + joinArgs(e->args) + ")";
+                fail(e->pos, "path no tiene la función '" + name + "'");
             }
             return "";
         }
@@ -1161,7 +1278,7 @@ class CppBackend {
         if (!e) return "0";
         switch (e->kind) {
             case Expr::Literal:
-                if (e->isString) return escapeString(e->value);
+                if (e->isStr) return escapeString(e->value);
                 if (e->value == "true") return "true";
                 if (e->value == "false") return "false";
                 if (e->value == "null") return "nullptr";
@@ -1178,26 +1295,12 @@ class CppBackend {
                 return "(" + expr(e->left) + " " + e->value + " " + expr(e->right) + ")";
 
             case Expr::Member: {
+                if (usePath && e->left && e->left->kind == Expr::Variable &&
+                    e->left->value == "path" && typeOfVar("path").empty() &&
+                    e->value == "currentDir")
+                    return "hbpl::path_currentDir()";
+
                 string base = expr(e->left);
-                if (e->value == "[]") return base + "[" + expr(e->args[0]) + "]";
-                if (e->value == "len") return "static_cast<int>(" + base + ".size())";
-                if (e->value == "push") return base + ".push_back";
-                if (e->value == "pop") return base + ".pop_back";
-                if (e->value == "clear") return base + ".clear";
-                if (base == "this") return "this->" + e->value;
-                // propiedades de request: req.body / req.path / req.method / req.query
-                if (useHttp && e->left && e->left->kind == Expr::Variable &&
-                    typeOfVar(e->left->value) == "request" &&
-                    (e->value == "body" || e->value == "path" ||
-                     e->value == "method" || e->value == "query"))
-                    return "hbpl::req_" + e->value + "(" + base + ")";
-                // Class variables are emitted as shared_ptr<T>.
-                if (e->left && e->left->kind == Expr::Variable) {
-                    const string& n = e->left->value;
-                    if (n != "Console") return base + "->" + e->value;
-                }
-                return base + "." + e->value;
-            }
 
             case Expr::Call: {
                 // Console
@@ -1535,7 +1638,7 @@ public:
                  "}\n";
         }
         o << "}\n\n";
-
+        if (hasImport(p, "path")) emitPathModule();
         // ---- clases ----
         for (auto& c : p.classes) {
             o << "struct " << c.name;
@@ -1703,9 +1806,12 @@ int main(int argc, char** argv) {
         string cmd = "g++ -std=c++17 \"" + cppPath + "\"";
         for (auto& s : extra) cmd += " \"" + s + "\"";
         cmd += " -o \"" + output + "\"";
+        string cmd = "g++ -std=c++17 \"" + cppPath + "\"";
+        for (auto& s : extra) cmd += " \"" + s + "\"";
+        cmd += " -o \"" + output + "\"";
         if (needHttp) {
 #ifdef _WIN32
-            cmd += " -lws2_32";
+            cmd += " -lws2_32 -pthread";     // <-- antes decía solo " -lws2_32"
 #else
             cmd += " -pthread";
 #endif
